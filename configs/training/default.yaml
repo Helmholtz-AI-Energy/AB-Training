@@ -22,3 +22,5 @@ optimizer: null
 init_opt_with_model: False
 
 print_freq: 10
+
+federated: null

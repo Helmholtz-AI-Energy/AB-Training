@@ -56,6 +56,8 @@ def main(config: DictConfig):
         fn = madonna.trainers.ortho_sam_trainer.main
     elif config.training.trainer == "lr_sync_train":
         fn = madonna.trainers.lr_sync_train.main
+    elif config.training.trainer == "fed_train":
+        fn = madonna.trainers.fed_train.main
     else:
         raise ValueError(f"unknown trainer: {config.trainer.trainer}")
 

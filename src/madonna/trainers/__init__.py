@@ -1,4 +1,5 @@
 from . import (
+    fed_train,
     images,
     lr_sync_train,
     my_opt_trainer,

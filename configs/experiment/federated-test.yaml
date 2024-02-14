@@ -1,0 +1,42 @@
+# @package _global_
+
+training:
+  start_epoch: 0
+  epochs: 300
+
+  # number of validation steps to execute at the beginning of the training
+  # num_sanity_val_steps: 0
+  trainer: "fed_train"
+  # ckpt path
+  checkpoint: null # /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models/baseine/vit_b_16-imagenet/epoch43.pth.tar #
+  checkpoint_out_root: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models
+  save_period: 25
+
+  lr: 0.0001
+  lr_schedule:
+    sched: cosine  # cosine LR scheduler from timm
+    epochs: 300  # number of epochs for the cycle to run for
+    warmup_epochs: 10
+    min_lr: 0.00001  # min LR of cosine annealing pattern
+    warmup_lr: 0.00001  # starting point of warmup
+
+  init_method: unified  # options: random, unified, random-sigma, ortho-sigma
+  federated: True
+  federated_args:
+    number_rolls: 0
+    compare_epoch_freq: 5
+
+model:
+  model: # vit_b_16 - timm
+    _target_: timm.models.resnet18
+    # patch_size: 8 # 16 # default: 16
+    # depth: 6 # 12 # default: 12
+    # num_heads: 6 # 12 # default: 12
+    # embed_dim: 768 # default: 768
+    # mlp_ratio: 4 # default: 4
+  name: resnet18
+  autocast: True
+
+name: fed-unified
+enable_tracking: True
+baseline: True

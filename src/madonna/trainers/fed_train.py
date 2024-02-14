@@ -45,24 +45,26 @@ log = logging.getLogger(__name__)
 
 
 def main(config):  # noqa: C901
-    log.info(config)
+    # log.info(config)
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
     print(hydra_cfg["runtime"]["output_dir"])
     # log.info("here is some log testing")
     # log.info("more stuff")
     # log.info("do i need more things?")
+    # raise ValueError
     for handler in log.parent.handlers:
         if isinstance(handler, logging.FileHandler):
             log_file = handler.baseFilename
     with open_dict(config):
         config["log_file_out"] = log_file
 
-    # return {"train loss": 0.75, "train top1": 52, "val loss": 0.54, "val top1": 85}
+    wandb_run = False
     if config.tracker == "wandb":
         wandb_run = madonna.utils.tracking.check_wandb_resume(config)
     if config.training.resume and not wandb_run:  # resume an interrupted run
         ckpt = config.training.checkpoint
         assert os.path.isfile(ckpt), "ERROR: --resume checkpoint does not exist"
+
     if config.training.checkpoint_out_root is not None:
         with omegaconf.open_dict(config):
             config.save_dir = madonna.utils.utils.increment_path(
@@ -74,7 +76,8 @@ def main(config):  # noqa: C901
         save_dir = Path(config.save_dir)
 
         # Directories
-        wdir = save_dir / "weights"
+        ex = "" if not config.training.federated else str(dist.get_rank())
+        wdir = save_dir / f"weights{ex}"
         wdir.mkdir(parents=True, exist_ok=True)  # make dir
         log.info(f"out_dir (wdir): {wdir}")
         last = wdir / "last.pt"
@@ -83,38 +86,6 @@ def main(config):  # noqa: C901
     # results_file = save_dir / 'results.txt'
     # f = open(results_file, 'w')
     wandb_logger = madonna.utils.tracking.WandbLogger(config) if config.rank == 0 and config.enable_tracking else None
-
-    # ----------------- Sweep stuffs --------------------------
-    if config.tracking.sweep is not None:
-        from mpi4py import MPI
-
-        if config.rank == 0:
-            sweep_config = wandb.config._as_dict()
-            for key in sweep_config:
-                if key == "_wandb":
-                    continue
-                # print(key, key in config)
-                # if key in config:
-                OmegaConf.update(config, key, sweep_config[key])
-            # dict_config.update(sweep_config)
-            print(sweep_config)
-            # need to send and update all the dicts
-        dict_config = OmegaConf.to_container(config, resolve=False)
-
-        comm = MPI.COMM_WORLD
-        new_dict = comm.bcast(dict_config, root=0)
-
-        dict_config["rank"] = dist.get_rank()
-        config = OmegaConf.create(new_dict)
-        with open_dict(config):
-            config.rank = dist.get_rank() if dist.is_initialized() else 0
-
-        if config.rank == 0:
-            pprint(dict(config))
-            # madonna.utils.tracking.log_config(config, wandb_logger)
-            if wandb_logger is not None:
-                wandb_logger.log(dict_config)
-            # wandb_logger.wandb_run.config.update(dict_config)
 
     if dist.is_initialized():
         gpu = dist.get_rank() % torch.cuda.device_count()  # only 4 gpus/node
@@ -133,6 +104,7 @@ def main(config):  # noqa: C901
     else:
         seed = int(config.seed)
         tseed = torch.tensor(seed, dtype=torch.int64, device=device)
+
     if config.training.init_method == "random":
         seed += config.rank
     elif dist.is_initialized() and config.training.init_method in ["unified", "random-sigma", "ortho-sigma"]:
@@ -162,27 +134,25 @@ def main(config):  # noqa: C901
     model = madonna.utils.get_model(config)
     if not config.cpu_training:
         model.cuda(gpu)
+    if config.training.init_method.endswith("-sigma"):
+        madonna.utils.utils.modify_model_random_simgas(
+            model,
+            device=gpu,
+            mode="rand" if config.training.init_method == "random-sigma" else "ortho",
+        )
 
-    if config.training.sync_batchnorm and dist.is_initialized():
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+    # if config.training.sync_batchnorm and dist.is_initialized():
+    #     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
 
-    # # TODO: fix model repr
-    # if dist.get_rank() == 0:
-    #     print(model.model)
-    if config.training.federated and config.baseline:
-        log.info("Using federated data scheme, model is not DDP")
-    elif config.baseline:
-        model = DDP(model)  # , device_ids=[config.rank])
-        log.info("using DDP baseline model")
-        # if dist.get_rank() == 0:
-        #     print(model)
-    # elif dist.is_initialized():
-    else:
-        model_hold = hydra.utils.instantiate(config.training.fixing_method)
-        model = model_hold(model).to(device)
-        log.info("using SVD model")
+    # if config.training.federated and config.baseline:
+    log.info("Using federated data scheme, model is not DDP")
+    # elif config.baseline:
+    #     model = DDP(model)  # , device_ids=[config.rank])
+    #     log.info("using DDP baseline model")
     # else:
-    #     log.info("using baseline 1 process model")
+    #     model_hold = hydra.utils.instantiate(config.training.fixing_method)
+    #     model = model_hold(model).to(device)
+    #     log.info("using SVD model")
 
     # if config.rank == 0:
     #     print(model)
@@ -192,22 +162,21 @@ def main(config):  # noqa: C901
     criterion = madonna.utils.get_criterion(config)
     optimizer = madonna.utils.get_optimizer(config, model, lr=config.training.lr)
     all_opts = {"normal": optimizer}
-    # set optimizer for references for SVD model to reset shapes of state params
-    if not config.baseline:
-        p_optim = hydra.utils.instantiate(config.training.p_optimizer)
-        all_opts["p"] = p_optim(model.parameters())
-        model.set_optimizers(optimizer_normal=optimizer, optimizer_p=all_opts["p"])
+    # # set optimizer for references for SVD model to reset shapes of state params
+    # if not config.baseline:
+    #     p_optim = hydra.utils.instantiate(config.training.p_optimizer)
+    #     all_opts["p"] = p_optim(model.parameters())
+    #     model.set_optimizers(optimizer_normal=optimizer, optimizer_p=all_opts["p"])
 
     dset_dict = madonna.utils.datasets.get_dataset(config)
     train_loader, train_sampler = dset_dict["train"]["loader"], dset_dict["train"]["sampler"]
     val_loader = dset_dict["val"]["loader"]
 
-    # sam_opt = madonna.optimizers.svd_sam.SAM(params=params, base_optimizer=optimizer, rho=0.05, adaptive=False)
     train_len = len(train_loader)
     scheduler, _ = madonna.utils.get_lr_schedules(config, optimizer, train_len)
 
-    if not config.baseline:
-        model.set_epoch_length(train_len)
+    # if not config.baseline:
+    #     model.set_epoch_length(train_len)
 
     # optionally resume from a checkpoint
     # Reminder: when resuming from a single checkpoint, make sure to call init_model with
@@ -245,16 +214,6 @@ def main(config):  # noqa: C901
                     scheduler.step(start_epoch)
         else:
             print(f"=> no checkpoint found at: {config.training.checkpoint}")
-
-    out_base = None
-    if "checkpoint_out_root" in config.training and config.training.checkpoint_out_root is not None:
-        out_base = Path(config.training.checkpoint_out_root)
-        model_name = config.model.name
-        dataset_name = config.data.dataset
-        out_base /= "baseline" if config.baseline else "svd"
-        out_base = out_base / f"{model_name}-{dataset_name}" / f"bs-{config.data.local_batch_size * config.world_size}"
-        out_base.mkdir(parents=True, exist_ok=True)
-        log.info(f"Saving model to: {out_base}")
 
     # # if config['evaluate']:
     # #     validate(val_loader, dlrt_trainer, config)
@@ -300,8 +259,9 @@ def main(config):  # noqa: C901
     #     log.info("partially syncing models in full rank")
     #     madonna.lrsync.sync.sync_model_in_low_rank(model, config)
     #     # madonna.lrsync.sync.sync_topn_singulars_oialr(model_param_dict, topn=10)
-    if not config.baseline and model.local_low_rank_model is not None:
-        model.mix_svd_layers()
+
+    # if not config.baseline and model.local_low_rank_model is not None:
+    #     model.mix_svd_layers()
 
     # just_synced = False
 
@@ -381,29 +341,19 @@ def main(config):  # noqa: C901
             config=config,
             epoch=epoch,
             device=device,
-            print_on_rank=config.rank == 0,
+            print_on_rank=True,  # config.rank == 0,
             pg=None,
             len_train=len_train,
             wandb_logger=wandb_logger,
             metrics=val_metrics,
         )
 
-        if config.rank == 0:
-            log.info(
-                f"Average val loss across process space: {val_loss} " f"-> diff: {train_loss - val_loss}",
-            )
-
-        # log the percentage of params in use
-        if config.rank == 0 and not config.baseline:
-            if hasattr(model, "get_perc_params_all_layers"):
-                perc, trainable, normal, compression_perc = model.get_perc_params_all_layers()
-                if config.enable_tracking:
-                    # mlflow.log_metric("perc_parmas", perc, step=epoch)
-                    wandb_logger.log({"perc_parmas": perc})  # , step=(epoch + 1) * len_train)
-                log.info(
-                    f"% params: {perc:.3f}% trainable: {trainable} full: {normal} compression: {compression_perc:.3f}%",
-                )
-                # model.track_interior_slices_mlflow(config, epoch)
+        # if config.rank == 0:
+        #     log.info(
+        #         f"Average val loss across process space: {val_loss} " f"-> diff: {train_loss - val_loss}",
+        #     )
+        if epoch % config.training.federated_args.compare_epoch_freq == 0 or epoch == config.training.epochs - 1:
+            madonna.utils.basis.compare_bases(model, baseline=True)
 
         # log metrics
         # train_metrics_epoch = train_metrics.compute()
@@ -422,6 +372,23 @@ def main(config):  # noqa: C901
         # Save model
         if dist.is_initialized():
             wait = dist.barrier(async_op=True)
+
+        log.info(
+            f"Epoch end metrics: \n\t"
+            # f"train f1/prec/rec: {log_dict['train/f1']:.4f} / "
+            # f"{log_dict['train/precision']:.4f} / {log_dict['train/recall']:.4f}"
+            f"val f1/prec/rec: {log_dict['val/f1']:.4f} / "
+            f"{log_dict['val/precision']:.4f} / {log_dict['val/recall']:.4f}",
+        )
+
+        ckpt = {
+            "epoch": epoch,
+            "best_fitness": best_fitness,
+            # 'training_results': results_file.read_text(),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        }
+
         if rank == 0 and config.enable_tracking:
             last_val_top1s.append(val_top1.item() if isinstance(val_top1, torch.Tensor) else val_top1)
             if len(last_val_top1s) > 10:
@@ -432,60 +399,42 @@ def main(config):  # noqa: C901
                 best_fitness = val_top1
 
             # print(train_metrics_epoch)
-            log.info(
-                f"Epoch end metrics: \n\t"
-                # f"train f1/prec/rec: {log_dict['train/f1']:.4f} / "
-                # f"{log_dict['train/precision']:.4f} / {log_dict['train/recall']:.4f}"
-                f"val f1/prec/rec: {log_dict['val/f1']:.4f} / "
-                f"{log_dict['val/precision']:.4f} / {log_dict['val/recall']:.4f}",
-            )
             wandb_logger.log(log_dict)
-
             wandb_logger.end_epoch(best_result=best_fitness == val_top1)
 
-            ckpt = {
-                "epoch": epoch,
-                "best_fitness": best_fitness,
-                # 'training_results': results_file.read_text(),
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "wandb_id": wandb_logger.wandb_run.id if wandb_logger.wandb else None,
-            }
-            print("After ckpt")
+            ckpt["wandb_id"] = (wandb_logger.wandb_run.id if wandb_logger.wandb else None,)
             # Save last, best and delete
-            if wdir is not None:
-                torch.save(ckpt, last)
-                # if best_fitness == val_top1:
-                #     torch.save(ckpt, best)
-                #     print("After 1st save")
-                if best_fitness == val_top1:
-                    torch.save(ckpt, wdir / "best_{:03d}.pt".format(epoch))
-                    print("After best save")
+        if wdir is not None:  # TODO: saving from ALL ranks here
+            torch.save(ckpt, last)
+            # if best_fitness == val_top1:
+            #     torch.save(ckpt, best)
+            #     print("After 1st save")
+            if best_fitness == val_top1:
+                torch.save(ckpt, wdir / "best_{:03d}.pt".format(epoch))
+                print("After best save")
 
-                if epoch == 0:  # first
-                    torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
-                    print("After 1st save")
-                elif (
-                    config.training.save_period != -1 and ((epoch + 1) % config.training.save_period) == 0
-                ):  # on command
-                    torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
-                    print("After periodic save")
-                # elif epoch >= (config.training.epochs - 5):
-                #     torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
+            if epoch == 0:  # first
+                torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
+                print("After 1st save")
+            elif config.training.save_period != -1 and ((epoch + 1) % config.training.save_period) == 0:  # on command
+                torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
+                print("After periodic save")
+            # elif epoch >= (config.training.epochs - 5):
+            #     torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
 
-                # if wandb_logger.wandb and config.enable_tracking:
-                #     if (
-                #         (epoch + 1) % config.training.save_period == 0 and not epoch == config.training.epochs - 1
-                #     ) and config.training.save_period != -1:
-                #         wandb_logger.log_model(
-                #             last.parent,
-                #             config,
-                #             epoch,
-                #             val_top1,
-                #             best_model=best_fitness == val_top1,
-                #         )
-                #         print("After wandb log model")
-                del ckpt
+            # if wandb_logger.wandb and config.enable_tracking:
+            #     if (
+            #         (epoch + 1) % config.training.save_period == 0 and not epoch == config.training.epochs - 1
+            #     ) and config.training.save_period != -1:
+            #         wandb_logger.log_model(
+            #             last.parent,
+            #             config,
+            #             epoch,
+            #             val_top1,
+            #             best_model=best_fitness == val_top1,
+            #         )
+            #         print("After wandb log model")
+            del ckpt
         if dist.is_initialized():
             # wait here for the saving and such...it didnt work to have it afterwards
             wait.wait(timeout=timedelta(seconds=60))
@@ -649,7 +598,7 @@ def train(
         #     raise ValueError
         argmax = torch.argmax(output, dim=1).to(torch.float32)
 
-        if (i % config.training.print_freq == 0 or i == len(train_loader) - 1) and config["rank"] == 0:
+        if i % config.training.print_freq == 0 or i == len(train_loader) - 1:  # and config["rank"] == 0:
             argmax = torch.argmax(output, dim=1).to(torch.float32)
             log.info(
                 f"Argmax outputs s "
@@ -665,10 +614,10 @@ def train(
         if not config.baseline:
             log.info(f"Average non-svd sync time: {tsync / updates_per_epoch}\t Total: {tsync}")
 
-    if dist.is_initialized():
-        losses.all_reduce()
-        top1.all_reduce()
-        top5.all_reduce()
+    # if dist.is_initialized():
+    #     losses.all_reduce()
+    #     top1.all_reduce()
+    #     top5.all_reduce()
 
     t1 = top1.avg.item() if isinstance(top1.avg, torch.Tensor) else top1.avg
     if config["rank"] == 0 and config.enable_tracking:
@@ -684,33 +633,6 @@ def train(
             },
         )
     return losses.avg, loss, refactory_warmup, t1
-
-
-@torch.no_grad()
-def save_selected_weights(network, epoch, config):
-    if not config.baseline:
-        raise RuntimeError(
-            "Weights should only be saved when running baseline! (remove for other data gathering)",
-        )
-    if not config.save_weights:
-        return
-    save_list = config.save_layers
-    save_location = Path(config.save_parent_folder) / config.model.name / "baseline_weights"
-    rank = dist.get_rank()
-
-    if rank != 0:
-        dist.barrier()
-        return
-    # save location: resnet18/name/epoch/[u, s, vh, weights
-    for n, p in network.named_parameters():
-        if n in save_list:
-            print(f"saving: {n}")
-            n_save_loc = save_location / n / str(epoch)
-            n_save_loc.mkdir(exist_ok=True, parents=True)
-
-            torch.save(p.data, n_save_loc / "p.pt")
-    # print("finished saving")
-    dist.barrier()
 
 
 @torch.no_grad()
@@ -825,10 +747,10 @@ def validate(val_loader, model, criterion, config, epoch, device, print_on_rank,
         run_validate(aux_val_loader, len(val_loader))
     val_time_total = time.perf_counter() - vt1
 
-    if dist.is_initialized():
-        losses.all_reduce()
-        top1.all_reduce()
-        top5.all_reduce()
+    # if dist.is_initialized():
+    #     losses.all_reduce()
+    #     top1.all_reduce()
+    #     top5.all_reduce()
 
     progress.display_summary(log=log, printing_rank=print_on_rank)
 

@@ -6,7 +6,7 @@ import torch.optim
 from omegaconf import open_dict
 from timm.scheduler import create_scheduler
 
-from . import comm, datasets, tracking
+from . import basis, comm, data_samplers, datasets, tracking
 from .utils import *
 
 
@@ -25,9 +25,8 @@ def get_model(config):
     model: nn.Module = hydra.utils.instantiate(config.model.model)
     # send model to devices
     if torch.cuda.is_available() and not config.cpu_training:
-        return model.cuda()
-    else:
-        return model
+        model = model.cuda()
+    return model
 
 
 def get_criterion(config):

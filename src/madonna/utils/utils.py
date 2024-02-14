@@ -11,6 +11,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+log = logging.getLogger(__name__)
+
 
 def only_on_rank_n(run_on_rank: int = 0):
     # run a command only on a specified rank
@@ -137,3 +139,76 @@ def roll_orthogonal_values(
         d = r.diagonal()
         ret = q * (d / d.abs()).unsqueeze(-2)
     return ret * scale_factor
+
+
+def reroll_model(layer: nn.Module):
+    if hasattr(layer, "reset_parameters"):
+        layer.reset_parameters()
+    else:
+        if hasattr(layer, "children"):
+            for child in layer.children():
+                reroll_model(child)
+
+
+@torch.no_grad()
+def modify_model_random_simgas(model: nn.Module, device: torch.device, mode: str = "rand"):
+    """
+    objective: roll the sigma matrix of the SVD representation of the multi-dim weights to be random
+               but the bases (U/V) of the reps will be the same on each rank
+
+    steps:
+        1. if the seed everywhere is the same for torch: move to sigma step
+           else: fix seed + re-init model
+        2. sigma step - create generator, roll random vals, scale to match original, sort?
+
+    Args:
+        model (nn.Module): model to work on
+        mode (str): mode for modifying sigmas
+            'rand' - sigmas are rolled randomly everywhere
+            'ortho' - sigmas are set to one
+    """
+    if mode not in ["rand", "ortho"]:
+        raise ValueError(f"mode arg must be in {['rand', 'ortho']}, currently: {mode}")
+    if not dist.is_initialized():
+        return
+    log.info("Rolling rankdom sigma values for multi dim weights")
+    # check if seeds are equal
+    rank = dist.get_rank()
+    ws = dist.get_world_size()
+    loc_seed = torch.random.initial_seed()
+    seeds = torch.zeros(ws, device=device)  # todo: fix device?
+    seeds[rank] = loc_seed
+    dist.all_reduce(seeds)
+    if not torch.all(seeds == loc_seed):
+        # there exist other seeds, need to unify and roll weights again
+        torch.manual_seed(seeds[0])
+        reroll_model(model)
+    # seeds and models are all the same now
+    # next: create a unique generator on each rank and roll sigma values
+    gen = torch.Generator(device=device)
+    gen = gen.manual_seed(int(seeds[0].item()) + rank)
+    for _n, p in model.named_parameters():
+        if p.ndim < 2:  # skip params with < 2D
+            continue
+        hld = p
+        if p.ndim > 2:  # collapse down to 2D
+            shp = p.shape
+            hld = p.view(p.shape[0], -1)
+        trans = hld.shape[0] < hld.shape[1]
+        if trans:  # make 2D rep TS
+            hld = hld.T
+        u, s, vh = torch.linalg.svd(hld, full_matrices=False)
+        if mode == "ortho":
+            news = torch.ones_like(s)
+        else:
+            news = torch.rand(s.shape[0], device=s.device, dtype=s.dtype, generator=gen)
+            news *= s[0]
+        # NOTE: this will ALWAYS shrink some of the values, range is [0, 1)
+        hld = u @ torch.diag(news) @ vh
+        if trans:
+            hld = hld.T
+        if p.ndim > 2:
+            hld = hld.view(shp)
+        # need to have contiguous for future torch internals
+        p.zero_()
+        p.add_(hld)

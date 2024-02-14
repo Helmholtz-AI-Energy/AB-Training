@@ -17,6 +17,8 @@ from PIL import ImageFile
 from timm.data.mixup import Mixup
 from timm.data.transforms_factory import create_transform
 
+from . import data_samplers
+
 log = logging.getLogger(__name__)
 
 try:
@@ -401,7 +403,13 @@ def imagenet_train_dataset_plus_loader(
         transform,
     )
 
-    if dist.is_initialized() and dsconfig["distributed_sample"]:
+    if dist.is_initialized() and config.training.federated:
+        train_sampler = data_samplers.HardSplitDistributedSampler(
+            train_dataset,
+            number_rolls=config.training.federated_args.number_rolls,
+            seed=dist.get_rank(),
+        )
+    elif dist.is_initialized() and dsconfig["distributed_sample"]:
         train_sampler = datadist.DistributedSampler(train_dataset)
     else:
         train_sampler = None
@@ -483,7 +491,13 @@ def imagenet_get_val_dataset_n_loader(
             del val_dataset.samples[rem]
         val_dataset.targets = new_labels
 
-    if dist.is_initialized() and dsconfig["distributed_sample_val"]:
+    if dist.is_initialized() and config.training.federated:
+        val_sampler = data_samplers.HardSplitDistributedSampler(
+            val_dataset,
+            number_rolls=config.training.federated_args.number_rolls,
+            seed=dist.get_rank(),
+        )
+    elif dist.is_initialized() and dsconfig["distributed_sample_val"]:
         val_sampler = datadist.DistributedSampler(val_dataset)
     elif dist.is_initialized() and group_size is not None and group_size > 1:
         val_sampler = datadist.DistributedSampler(
@@ -554,7 +568,13 @@ def cifar10_train_dataset_plus_loader(config, group_size=None, group_rank=None, 
     )
 
     # Data loader
-    if dist.is_initialized() and config.data.distributed_sample:
+    if dist.is_initialized() and config.training.federated:
+        train_sampler = data_samplers.HardSplitDistributedSampler(
+            train_dataset,
+            number_rolls=config.training.federated_args.number_rolls,
+            seed=dist.get_rank(),
+        )
+    elif dist.is_initialized() and config.data.distributed_sample:
         train_sampler = datadist.DistributedSampler(train_dataset)
     elif dist.is_initialized() and group_size is not None and group_size > 1:
         train_sampler = datadist.DistributedSampler(
@@ -614,17 +634,23 @@ def cifar10_val_dataset_n_loader(config, group_size=None, group_rank=None, num_g
         download=True,
     )
 
-    if dist.is_initialized() and dsconfig["distributed_sample_val"]:
-        sampler = datadist.DistributedSampler(test_dataset)
-    elif dist.is_initialized() and group_size is not None and group_size > 1:
-        sampler = datadist.DistributedSampler(
-            test_dataset,
-            rank=group_rank,
-            num_replicas=group_size,
-            seed=dist.get_rank() // group_size,
-        )
-    else:
-        sampler = None
+    # if dist.is_initialized() and config.training.federated:
+    #     sampler = data_samplers.HardSplitDistributedSampler(
+    #         test_dataset,
+    #         number_rolls=config.training.federated_args.number_rolls,
+    #         seed=dist.get_rank(),
+    #     )
+    # elif dist.is_initialized() and dsconfig["distributed_sample_val"]:
+    #     sampler = datadist.DistributedSampler(test_dataset)
+    # elif dist.is_initialized() and group_size is not None and group_size > 1:
+    #     sampler = datadist.DistributedSampler(
+    #         test_dataset,
+    #         rank=group_rank,
+    #         num_replicas=group_size,
+    #         seed=dist.get_rank() // group_size,
+    #     )
+    # else:
+    sampler = None
 
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
@@ -684,7 +710,13 @@ def cifar100_train_dataset_plus_loader(config, group_size=None, group_rank=None,
     )
 
     # Data loader
-    if dist.is_initialized() and config.data.distributed_sample:
+    if dist.is_initialized() and config.training.federated:
+        train_sampler = data_samplers.HardSplitDistributedSampler(
+            train_dataset,
+            number_rolls=config.training.federated_args.number_rolls,
+            seed=dist.get_rank(),
+        )
+    elif dist.is_initialized() and config.data.distributed_sample:
         train_sampler = datadist.DistributedSampler(train_dataset)
     elif dist.is_initialized() and group_size is not None and group_size > 1:
         train_sampler = datadist.DistributedSampler(
@@ -744,7 +776,13 @@ def cifar100_val_dataset_n_loader(config, group_size=None, group_rank=None, num_
         download=True,
     )
 
-    if dist.is_initialized() and dsconfig["distributed_sample_val"]:
+    if dist.is_initialized() and config.training.federated:
+        test_sampler = data_samplers.HardSplitDistributedSampler(
+            test_dataset,
+            number_rolls=config.training.federated_args.number_rolls,
+            seed=dist.get_rank(),
+        )
+    elif dist.is_initialized() and dsconfig["distributed_sample_val"]:
         test_sampler = datadist.DistributedSampler(test_dataset)
     elif dist.is_initialized() and group_size is not None and group_size > 1:
         test_sampler = datadist.DistributedSampler(
@@ -792,7 +830,13 @@ def mnist_train_data(config, group_size=None, group_rank=None, num_groups=None):
         transform = transforms.Compose([transforms.ToTensor(), mnist_normalize])
     train_dataset = datasets.MNIST(base_dir, train=True, download=True, transform=transform)
 
-    if dist.is_initialized() and dsconfig["distributed_sample"]:
+    if dist.is_initialized() and config.training.federated:
+        train_sampler = data_samplers.HardSplitDistributedSampler(
+            train_dataset,
+            number_rolls=config.training.federated_args.number_rolls,
+            seed=dist.get_rank(),
+        )
+    elif dist.is_initialized() and dsconfig["distributed_sample"]:
         train_sampler = datadist.DistributedSampler(train_dataset)
     else:
         train_sampler = None
@@ -832,7 +876,13 @@ def mnist_val_data(config, group_size=None, group_rank=None, num_groups=None):
         transform = transforms.Compose([transforms.ToTensor(), mnist_normalize])
     val_dataset = datasets.MNIST(base_dir, train=False, transform=transform)
 
-    if dist.is_initialized() and dsconfig["distributed_sample_val"]:
+    if dist.is_initialized() and config.training.federated:
+        sampler = data_samplers.HardSplitDistributedSampler(
+            val_dataset,
+            number_rolls=config.training.federated_args.number_rolls,
+            seed=dist.get_rank(),
+        )
+    elif dist.is_initialized() and dsconfig["distributed_sample_val"]:
         sampler = datadist.DistributedSampler(val_dataset)
     elif dist.is_initialized() and group_size is not None and group_size > 1:
         sampler = datadist.DistributedSampler(

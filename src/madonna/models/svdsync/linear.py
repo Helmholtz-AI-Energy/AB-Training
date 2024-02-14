@@ -93,7 +93,7 @@ class SVDSyncLinear(nn.Module):
 
         # u, s, vh = torch.linalg.svd(w, full_matrices=False)
         # k = min(tuple(w.shape))
-        u, s, vh = torch.linalg.svd(w, full_matrices=False)  # TS matrix so its not a big deal
+        u, s, vh = torch.linalg.svd(w, full_matrices=False)  # TS matrix so its can be compressed better
         self.gen = torch.Generator(device=w.device)
         self.gen.manual_seed(random.randint(0, 68719476735))
         if random_sigma:
