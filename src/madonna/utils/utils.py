@@ -3,7 +3,7 @@ from __future__ import annotations
 import glob
 import logging
 import re
-from functools import wraps
+from functools import reduce, wraps
 from pathlib import Path
 from typing import Any, Callable, List, Tuple, Union
 
@@ -180,7 +180,7 @@ def modify_model_random_simgas(model: nn.Module, device: torch.device, mode: str
     seeds[rank] = loc_seed
     dist.all_reduce(seeds)
     if not torch.all(seeds == loc_seed):
-        # there exist other seeds, need to unify and roll weights again
+        # there exist other seeds (models are not the same), need to unify and roll weights again
         torch.manual_seed(seeds[0])
         reroll_model(model)
     # seeds and models are all the same now
@@ -212,3 +212,15 @@ def modify_model_random_simgas(model: nn.Module, device: torch.device, mode: str
         # need to have contiguous for future torch internals
         p.zero_()
         p.add_(hld)
+
+
+def rsetattr(obj, attr, val):
+    pre, _, post = attr.rpartition(".")
+    return setattr(rgetattr(obj, pre) if pre else obj, post, val)
+
+
+def rgetattr(obj, attr, *args):
+    def _getattr(obj, attr):
+        return getattr(obj, attr, *args)
+
+    return reduce(_getattr, [obj] + attr.split("."))

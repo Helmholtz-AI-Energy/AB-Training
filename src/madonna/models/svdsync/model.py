@@ -252,21 +252,6 @@ class SVDSyncModel(nn.Module):
 
         # No reason not to do DDP training if we can ignore the low-rank parameters
         self.ddp_model = DDP(self.model)
-        # if dist.get_rank() == 0:
-        #     ids = []
-        #     dct = {}
-        #     for n, p in self.model.named_parameters():
-        #         # print(n, id(p))
-        #         ids.append(id(p))
-        #         dct[id(p)] = n
-        #     for p in self.ddp_model._module_parameters:
-        #         del dct[id(p)]
-        #     print(dct)
-        # raise ValueError
-        # self.non_svd_params = []
-        # for n, p in self.named_parameters():
-        #     if not n.endswith((".s", ".u", ".vh")) and p.requires_grad:
-        #         self.non_svd_params.append(p)
 
     def _replace_layers(self, module, name=None, process_group=None):
         module_output = module

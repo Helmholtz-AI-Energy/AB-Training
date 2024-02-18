@@ -14,6 +14,8 @@ from torch.distributed.distributed_c10d import (
     _store_based_barrier,
 )
 
+from . import utils
+
 _DATA_PARALLEL_GROUP = None
 _DATA_PARALLEL_ROOT = 0
 
@@ -266,6 +268,42 @@ def init_split(
     return mpi_comm, mpi_instance_comm, instance_id, batchnorm_group
 
 
+def split_process_group_node_local(num_gpus_per_node=4):
+    """
+    Splits a PyTorch process group into node-local groups with ranks 0..(num_gpus_per_node - 1) on each node
+    and a group which holds rank N on all nodes (i.e. all local-rank 0 process in group0, all local-rank 1, etc.)
+
+    Args:
+        num_gpus_per_node (int, optional): Number of GPUs per node. Defaults to 4.
+
+    Returns:
+        dict: {
+            "local": node local group,
+            f"only{N}": group with only the processes with local rank N -> if no group there (not member) == False
+        }
+    """
+    global_rank = dist.get_global_rank()
+    world_size = dist.get_world_size()
+
+    # 1. Determine the node information
+    num_nodes = world_size // num_gpus_per_node
+    node_id = global_rank // num_gpus_per_node
+
+    # 2. Create node-local process groups
+    node_ranks = [node_id * num_gpus_per_node + gpu_id for gpu_id in range(num_gpus_per_node)]
+    node_local_group = dist.new_group(ranks=node_ranks)
+
+    groups = {"local": node_local_group}
+
+    # 3. Determine the rank within the node-local group
+    for g in range(num_gpus_per_node):
+        groups[f"only{g}"] = dist.new_group(ranks=[g * n for n in num_nodes])
+        if groups[f"only{g}"] is None:
+            groups[f"only{g}"] = False
+
+    return groups
+
+
 # do regular init
 def init(method, ranks_per_gpu=1, batchnorm_group_size=1, batchnorm_group_stride=1):
     # get master address and port
@@ -483,3 +521,28 @@ def init_and_set_config_rank_size(config):
             pass
 
     return rank, size
+
+
+def average_spec_objects_in_model(model, object_names: list, group=dist.group.WORLD):
+    """Averages parameters of specified layers across multiple workers in a PyTorch distributed setup.
+
+    Args:
+        model (torch.nn.Module): The PyTorch model containing the layers.
+        object_names (list): List of names of the model objects to average.
+        group (dist.ProcessGroup, optional): The process group for communication. Defaults to WORLD.
+    """
+    waits = []
+    for name in object_names:
+        # Ensure the selected layer has parameters to average
+        # if hasattr(model.modules(), f"module_{idx}") and list(model.module_[idx].parameters()):
+
+        params = list(utils.rgetattr(model, name).parameters())
+
+        # Sum the parameters across all workers
+        for p in params:
+            p.data /= dist.get_world_size(group)
+            waits.append(dist.all_reduce(p.data, op=dist.ReduceOp.SUM, group=group, async_op=True))
+
+    # Average the parameters in place
+    for w in waits:
+        w.wait()

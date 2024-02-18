@@ -165,8 +165,7 @@ class OIALRModel(nn.Module):
         self.stable_list = []
         self.stable_update_delay = stable_update_delay
 
-        self.fib1, self.fib2 = 0, 1
-        self.next_stability_iteration = self.delay + self.fib1
+        self.next_stability_iteration = self.delay
 
         self.optimizer = None  # optimizers.MixedSVDOpt
         self.local_generator = torch.Generator()
