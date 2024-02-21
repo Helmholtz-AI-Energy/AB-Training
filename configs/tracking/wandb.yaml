@@ -13,7 +13,10 @@
 #   job_type: "train"
 #   group: ""
 #   tags: []
-project: "lr-sync"
+logging_rank: all  # options: rank number of 'all', all logs from all
+tracking_rank: 0
+save_checkpoints: False
+project: "lr-dist"
 sweep: null
 # tags:
 #   - final

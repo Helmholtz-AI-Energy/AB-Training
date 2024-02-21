@@ -26,7 +26,7 @@ model: # vit_b_16 - timm
   qkv_bias: False
   drop_path_rate: 0.0
   num_classes: null  # get this from datasets -> classes
-name: vit_b_16_timm_mini
+name: vit_mini
 autocast: True
 
 # model:  # vit_b_32
