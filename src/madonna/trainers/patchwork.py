@@ -284,6 +284,116 @@ class PatchworkSVDTrainer(BasicTrainer):
             w.wait()
 
     @torch.no_grad()
+    def _all_to_all_sync_cat1d(self):
+        # in this sync, all procs give them same number of ranks, last ones are set to zero and ignored??
+
+        # TODO: check memory hit, might be very high if keeping all the USVh mats
+        for n in self.names_to_cat1d:
+            base_weight = utils.rgetattr(self.model, n)
+            base_2d_repr, trans, shp = basis.get_2d_repr(base_weight)
+            catted, cat_names_n = basis.get_2d_rep_w_1d_names(
+                model=self.model,
+                base_2d=base_2d_repr,
+                base_name=n,
+                names1d=self.names_to_cat1d[n],
+            )
+            self.cat1d_dims[n] = cat_names_n
+            u, s, vh = torch.linalg.svd(catted, full_matrices=False)
+            # this one will use USVh in place and will just move things around
+            # leftover = s.shape[0] % self.world_size -> handled automatically by zeroing
+            keeping = s.shape[0] // self.world_size
+            start = keeping * self.rank
+            stop = keeping * (self.rank + 1)
+            u_sel = u[:keeping].clone()
+            s_sel = s[:keeping].clone()
+            vh_sel = vh[:, :keeping].clone()
+            u.zero_()
+            s.zero_()
+            vh.zero_()
+            u[start:stop] = u_sel
+            s[start:stop] = s_sel
+            vh[start:stop] = vh_sel
+
+            wait_u = dist.all_reduce(u, async_op=True)
+            wait_s = dist.all_reduce(s, async_op=True)
+            wait_vh = dist.all_reduce(vh, async_op=True)
+            # TODO: seperate loop to let comms have time????
+            wait_u.wait()
+            wait_s.wait()
+            wait_vh.wait()
+            # undo 1d concatenating
+            base_2d_repr, one_d_params = basis.get_1ds_from_2dcombi(
+                u @ s.diag() @ vh,
+                cat_dims=self.cat1d_dims[n],
+            )
+            # set 1D params
+            for n1d in one_d_params:
+                param = utils.rgetattr(self.model, n1d)
+                param.zero_()
+                param.add_(one_d_params[n1d])
+            # set ND param
+            if trans:
+                base_2d_repr = base_2d_repr.T
+            base_2d_repr = base_2d_repr.view(shp)
+            base_weight.zero_()
+            base_weight.add_(base_2d_repr)
+
+    @torch.no_grad()
+    def _all_to_all_sync_no_cat1d(self):
+        # in this sync, all procs give them same number of ranks, last ones are set to zero and ignored??
+
+        # TODO: check memory hit, might be very high if keeping all the USVh mats
+        for n in self.names_to_cat1d:
+            base_weight = utils.rgetattr(self.model, n)
+            base_2d_repr, trans, shp = basis.get_2d_repr(base_weight)
+            u, s, vh = torch.linalg.svd(base_2d_repr, full_matrices=False)
+            # this one will use USVh in place and will just move things around
+            keeping = s.shape[0] // self.world_size
+            start = keeping * self.rank
+            stop = keeping * (self.rank + 1)
+            u_sel = u[:keeping].clone()
+            s_sel = s[:keeping].clone()
+            vh_sel = vh[:, :keeping].clone()
+            u.zero_()
+            s.zero_()
+            vh.zero_()
+            u[start:stop] = u_sel
+            s[start:stop] = s_sel
+            vh[start:stop] = vh_sel
+
+            wait_u = dist.all_reduce(u, async_op=True)
+            wait_s = dist.all_reduce(s, async_op=True)
+            wait_vh = dist.all_reduce(vh, async_op=True)
+            # TODO: seperate loop to let comms have time????
+            wait_u.wait()
+            wait_s.wait()
+            wait_vh.wait()
+            # undo 1d concatenating
+            base_2d_repr = u @ s.diag() @ vh
+            # set ND param
+            if trans:
+                base_2d_repr = base_2d_repr.T
+            base_2d_repr = base_2d_repr.view(shp)
+            base_weight.zero_()
+            base_weight.add_(base_2d_repr)
+
+    @torch.no_grad()
+    def _all_to_all_sync(self):
+        waits = []
+        for n in self.names_to_average:
+            p = utils.rgetattr(self.model, n)
+            p /= self.world_size
+            waits.append(dist.all_reduce(p, async_op=True))
+
+        if self.cat1d:
+            self._all_to_all_sync_cat1d()
+        else:
+            self._all_to_all_sync_no_cat1d()
+
+        for w in waits:
+            w.wait()
+
+    @torch.no_grad()
     def _pre_forward(self):
         # select model for forward step
         # if self.total_train_iterations < self.warmup_steps:

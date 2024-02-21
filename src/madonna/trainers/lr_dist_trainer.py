@@ -143,12 +143,6 @@ class LowRankSyncTrainer(BasicTrainer):
             basis.compare_bases_across_ranks(self.model)
 
             waits = {}
-            # rank = dist.get_rank()
-            # print(dist.get_rank(), self.logging_rank)
-            # if dist.get_rank() == self.logging_rank:
-            #     log.info(self.total_train_iterations)
-            #     log.info("Sim to old model:")
-            #     basis.compare_bases_baseline(self.model, self.old_model, print_rank=self.logging_rank)
             svd_stuff = {}
             for n, p in self.model.named_parameters():
                 if n not in self.names_not_sync_in_indiv or p.ndim == 1:
@@ -196,32 +190,39 @@ class LowRankSyncTrainer(BasicTrainer):
                             f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
                             f"<50% of first: {nz50perc:.4f}",
                         )
-
-                    # basis.get_og_repr((u @ s.diag()) @ vh, trans, shp, set_loc=p)
-
-                # w.wait()
                 utils.reset_adam_state(self.optimizer, p)
             self.model_to_run = self.model
+        elif (
+            self.total_train_iterations % (self.steps_btw_syncing // 3) == 0
+            and self.total_train_iterations > self.warmup_steps
+        ):
+            # finish average here -> receive everything - wait? then we dont need to do the weighted average...
+            # for now, can just have this be blocking
+            if self.rank == self.logging_rank:
+                log.info(f"Compare sigma distribution: {self.current_iter}")
 
-            # # local shuffle of sigma
-            # with torch.no_grad():
-            #     for n, p in self.model.named_parameters():
-            #         if n in self.names_to_always_sync:
-            #             continue
-            #         two_d_repr, trans, shp = basis.get_2d_repr(p)
-            #         if two_d_repr is not None:
-            #             u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
-            #             # mixing.exp_update_usvh_mix_sigma(u, s, vh, 1)
-            #             # basis.get_og_repr(u @ s @ vh, trans, shp, set_loc=p)
-            #             order = torch.randperm(s.shape[0], generator=self.local_gen, device=s.device)
-            #             new_s = s[order]
-            #             basis.get_og_repr(u @ new_s.diag() @ vh, trans, shp, set_loc=p)
+            # basis.compare_bases_across_ranks(self.model)
 
-            # if dist.get_rank() == self.logging_rank:
-            #     log.info("Sim avg model v old:")
-            #     basis.compare_bases_baseline(self.model, self.old_model, print_rank=self.logging_rank)
-            # self.old_model = deepcopy(self.model)
-        # pass
+            for n, p in self.model.named_parameters():
+                if n not in self.names_not_sync_in_indiv or p.ndim == 1:
+                    continue
+                else:
+                    # print(f"sigma sync: {n}")
+                    two_d_repr, trans, shp = basis.get_2d_repr(p)
+                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
+
+                    if self.rank == self.logging_rank:
+                        nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
+                        nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
+                        nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
+
+                        print(
+                            f"{n}: {s.mean():.4f}, {s.min():.4f}, {s.max():.4f} "
+                            f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
+                            f"<50% of first: {nz50perc:.4f}",
+                        )
+                utils.reset_adam_state(self.optimizer, p)
+            self.model_to_run = self.model
 
     def _log_train(self, loss):
         # todo: metrics...

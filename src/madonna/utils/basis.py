@@ -115,9 +115,10 @@ def compare_bases_baseline(model1: nn.Module, model2: nn.Module, baseline: bool 
 
 
 def get_2d_repr(weight: torch.Tensor) -> list[torch.Tensor, bool, torch.Size]:
-    if weight.ndim < 2:
+    dims = weight.squeeze().ndim
+    if dims < 2:
         return None, False, weight.shape
-    if weight.ndim == 2:
+    if dims == 2:
         trans = weight.shape[0] < weight.shape[1]
         return weight.T if trans else weight, trans, weight.shape
 
