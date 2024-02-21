@@ -44,18 +44,10 @@ def main(config: DictConfig):
         config["rank"] = rank
         config["global_batch_size"] = config.data.local_batch_size * size
 
-    if config.training.trainer == "slime":
-        fn = madonna.trainers.slime_trainer.main
-    elif config.training.trainer == "image-baseline":
-        fn = madonna.trainers.images.baseline.main
-    elif config.training.trainer == "MyOpt":
-        fn = madonna.trainers.my_opt_trainer.main
-    elif config.training.trainer == "ortho_fix_train":
+    if config.training.trainer == "ortho_fix_train":
         fn = madonna.trainers.ortho_fix_train.main
-    elif config.training.trainer == "ortho_sam_train":
-        fn = madonna.trainers.ortho_sam_trainer.main
-    elif config.training.trainer == "lr_sync_train":
-        fn = madonna.trainers.lr_sync_train.main
+    elif config.training.trainer == "lr_dist_train":
+        fn = madonna.trainers.lr_dist_script.main
     elif config.training.trainer == "fed_train":
         fn = madonna.trainers.fed_train.main
     else:

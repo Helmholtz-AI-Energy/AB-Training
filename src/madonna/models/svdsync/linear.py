@@ -7,7 +7,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import mixing, utils
+from ...utils import mixing
+from . import utils
 
 log = logging.getLogger(__name__)
 

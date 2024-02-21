@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 
-from ..models.oialr import SVDLinear, SVDMultiheadAttention
+from ..models.oialr import SVDLinearUSVh, SVDMultiheadAttentionUSVh
 from .utils import change_adam_shapes, change_sgd_shapes
 
 log = logging.getLogger(__name__)
@@ -68,7 +68,7 @@ class MixedSVDOpt(object):
             if module.bias is not None:
                 self.params_non2d.append(module.bias)
             self.params_weights.append(module.weight)
-        elif isinstance(module, SVDLinear):
+        elif isinstance(module, SVDLinearUSVh):
             if module.bias is not None:
                 self.params_non2d.append(module.bias)
             self.params_weights.append(module.weight)
@@ -87,7 +87,7 @@ class MixedSVDOpt(object):
                 self.params_non2d.append(module.bias_k)
             if module.bias_v is not None:
                 self.params_non2d.append(module.bias_v)
-        elif isinstance(module, SVDMultiheadAttention):
+        elif isinstance(module, SVDMultiheadAttentionUSVh):
             if module.in_proj_weight is not None:
                 self.params_weights.append(module.in_proj_weight)
                 self.params_sigma.append(module.in_proj_s)

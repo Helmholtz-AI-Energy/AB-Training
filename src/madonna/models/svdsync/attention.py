@@ -10,7 +10,8 @@ from torch import Tensor
 from torch.nn import Parameter
 from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
 
-from . import mixing, utils
+from ...utils import mixing
+from . import utils
 
 log = logging.getLogger(__name__)
 

@@ -13,7 +13,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.common_types import _size_1_t, _size_2_t, _size_3_t
 
-from . import mixing, utils
+from ...utils import mixing
+from . import utils
 
 
 def _ntuple(n, name="parse"):
