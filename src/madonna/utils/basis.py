@@ -128,25 +128,6 @@ def get_2d_repr(weight: torch.Tensor) -> list[torch.Tensor, bool, torch.Size]:
     return hld.T if trans else hld, trans, shp
 
 
-def get_og_repr(weight: torch.Tensor, trans: bool, shp: torch.Size, reshape=False, set_loc=None) -> torch.Tensor:
-    if trans:
-        weight = weight.T
-    if shp == weight.shape:
-        if set_loc is not None:
-            set_loc.zero_()
-            set_loc.add_(weight)
-            return
-        else:
-            return weight
-    if reshape:
-        if set_loc is not None:
-            set_loc.zero_()
-            set_loc.add_(weight.view(shp))
-            return
-        else:
-            return weight.reshape(shp)
-
-
 def get_2d_rep_w_1d_names(
     model: nn.Module,
     base_2d: torch.Tensor,
@@ -184,7 +165,7 @@ def get_2d_rep_w_1d_names(
     return base_2d, cat_dims
 
 
-def get_1ds_from_2dcombi(catted2d: torch.Tensor, assoc_1dnames: list, cat_dims: dict) -> tuple[torch.Tensor, dict]:
+def get_1ds_from_2dcombi(catted2d: torch.Tensor, cat_dims: dict) -> tuple[torch.Tensor, dict]:
     """Extracts 1D tensors from a concatenated 2D tensor.
 
     This function reverses the process of concatenation performed by
@@ -194,7 +175,6 @@ def get_1ds_from_2dcombi(catted2d: torch.Tensor, assoc_1dnames: list, cat_dims: 
 
     Args:
         catted2d (torch.Tensor): The concatenated 2D tensor.
-        assoc_1dnames (list): List of names of the associated 1D tensors.
         cat_dims (dict): Dictionary mapping 1D tensor names to their concatenation dimensions.
 
     Returns:
@@ -203,7 +183,7 @@ def get_1ds_from_2dcombi(catted2d: torch.Tensor, assoc_1dnames: list, cat_dims: 
             * Dictionary containing the extracted 1D tensors, mapped to their names.
     """
     ret = {}
-    for n in reversed(assoc_1dnames):  # need to work from the outside in to get everything correctly
+    for n in reversed(list(cat_dims.keys())):  # need to work from the outside in to get everything correctly
         sl = [slice(None), slice(None)]
         sl[cat_dims[n]] = -1
         ret[n] = catted2d[sl]
@@ -212,7 +192,7 @@ def get_1ds_from_2dcombi(catted2d: torch.Tensor, assoc_1dnames: list, cat_dims: 
     return catted2d, ret
 
 
-def get_1d_associated_weights(model: torch.Tensor, names_to_ignore: list) -> dict:
+def get_1d_associated_weights(model: torch.Tensor, names_to_ignore: list = None) -> tuple[dict, list]:
     """Get a dictionary which contains the 1D weights which occur after an ND weight
     If the first layers of a network are 1D, they will be ignored.
 
@@ -230,13 +210,19 @@ def get_1d_associated_weights(model: torch.Tensor, names_to_ignore: list) -> dic
     join_dict = {}
     last_miltidim_w = None
 
+    ignored_names = [] if names_to_ignore is None else names_to_ignore
+
     for n, p in model.named_parameters():
         if n in names_to_ignore:
+            ignored_names.append(n)
             continue
-
-        if p.ndim > 1 and last_miltidim_w is not None:
+        dims = p.squeeze().ndim
+        if dims > 1 and last_miltidim_w is not None:
             last_miltidim_w = n
             join_dict[n] = []
-        elif last_miltidim_w is not None and p.ndim == 1:
+        elif last_miltidim_w is not None and dims == 1:
             join_dict[last_miltidim_w].append(n)
-    return join_dict
+        else:  # names which are not touched by the rest are here
+            ignored_names.append(n)
+
+    return join_dict, ignored_names
