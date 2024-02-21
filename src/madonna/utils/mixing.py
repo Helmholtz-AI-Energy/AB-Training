@@ -1,11 +1,15 @@
 import torch
 
+from .basis import get_2d_repr, get_og_repr
+
 
 def mix_sigma(u, s, vh, method: str = "exp", generator=None, *args, **kwargs):
     if method == "rbf":
         return rbf_update_usvh_mix_sigma(*args, u=u, s=s, vh=vh, generator=generator, **kwargs)
     elif method == "exp":
         return exp_update_usvh_mix_sigma(u=u, s=s, vh=vh, **kwargs)
+    elif method == "shuffle":
+        return shuffle_update_usvh_mix_sigma(u=u, s=s, vh=vh, **kwargs)
     elif method is None:
         pass
     else:
@@ -67,13 +71,14 @@ def exp_update_usvh_mix_sigma(u, s, vh, scaling=100):
     # NOTE: this will update U/S/Vh IN PLACE!!!
     # mix sigma with a specified method, only RBF available right now
 
-    usig, sig, vhsig = torch.linalg.svd(s, full_matrices=False)
-    holdu = u @ usig
-    u.zero_()
-    u.add_(holdu)
-    holdvh = vhsig @ vh
-    vh.zero_()
-    vh.add_(holdvh)
+    # usig, sig, vhsig = torch.linalg.svd(s, full_matrices=False)
+    # holdu = u @ usig
+    # u.zero_()
+    # u.add_(holdu)
+    # holdvh = vhsig @ vh
+    # vh.zero_()
+    # vh.add_(holdvh)
+    ns = s.diag() if s.ndim == 1 else s
 
     def _generate_diag_decreasing_like(sigma):
         n = sigma.shape[0]
@@ -81,8 +86,37 @@ def exp_update_usvh_mix_sigma(u, s, vh, scaling=100):
         matrix = (n - torch.abs(ar.view(-1, 1) - ar.view(1, -1))) / n
         return matrix
 
-    scaling = sig.shape[0] / scaling
-    m = torch.exp(scaling * _generate_diag_decreasing_like(sig) - scaling).triu()
-    s = sig * m
-    s.zero_()
-    s.add_(s)
+    scaling = ns.shape[0] / scaling
+    m = torch.exp(scaling * _generate_diag_decreasing_like(s) - scaling).triu()
+    ns = ns * m
+    s.set_(ns)
+    # s.zero_()
+    # s.add_(s)
+
+
+def shuffle_update_usvh_mix_sigma(u=None, s=None, vh=None, weight=None):
+    """ """
+    # NOTE: this will update everything IN PLACE!!!
+    # mix sigma with a specified method, only RBF/exp/shuffle available right now
+    if weight is None:
+        usig, sig, vhsig = torch.linalg.svd(s, full_matrices=False)
+        holdu = u @ usig
+        u.zero_()
+        u.add_(holdu)
+        holdvh = vhsig @ vh
+        vh.zero_()
+        vh.add_(holdvh)
+    else:
+        hld, trans, shp = get_2d_repr(weight)
+        u, sig, vh = torch.linalg.svd(hld, full_matrices=False)
+    # TODO: process-local permutation
+    perm = torch.randperm(s.shape[0])
+    sig = sig[perm]
+
+    if weight is None:
+        s.zero_()
+        s.add_(s)
+    else:
+        new_w = get_og_repr(u @ sig.diag() @ vh, trans, shp)
+        weight.zero_()
+        weight.add_(new_w)

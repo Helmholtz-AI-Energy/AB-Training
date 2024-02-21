@@ -1,0 +1,47 @@
+# @package _global_
+
+training:
+  start_epoch: 0
+  epochs: 300
+  iterations_per_train: 50
+
+  # number of validation steps to execute at the beginning of the training
+  # num_sanity_val_steps: 0
+  trainer: "lr_dist_train"
+  # ckpt path
+  checkpoint: null # /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models/baseine/vit_b_16-imagenet/epoch43.pth.tar #
+  checkpoint_out_root: null  #/hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models
+  save_period: 25
+
+  lr: 0.001
+  lr_schedule:
+    sched: cosine  # cosine LR scheduler from timm
+    epochs: 300  # number of epochs for the cycle to run for
+    warmup_epochs: 10
+    min_lr: 0.00001  # min LR of cosine annealing pattern
+    warmup_lr: 0.00001  # starting point of warmup
+
+  init_method: ortho-sigma  # options: random, unified, random-sigma, ortho-sigma
+  syncing:
+    warmup_steps: 0
+    # sync_freq: 100
+    steps_btw_syncing: 250
+    names_to_always_sync: null
+      # - fc.weight
+      # - fc.bias
+      # - conv1.weight
+      # - cls_token
+      # - pos_embed
+      # - head.weight
+
+
+data:
+  timm_transforms: False
+  local_batch_size: 1024
+
+tracking:
+  logging_rank: 0
+
+name: only-sigma-sync-1024
+enable_tracking: False
+baseline: True

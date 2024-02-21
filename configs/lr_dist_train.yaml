@@ -3,13 +3,13 @@
 defaults:
   - _self_
   - data: cifar10.yaml # imagenet.yaml #
-  - model: vit.yaml # resnet.yaml # resnet-rs.yaml # cirsean4.yaml # conv_dense.yaml #
+  - model: resnet.yaml # vit.yaml # resnet-rs.yaml # cirsean4.yaml # conv_dense.yaml #
   - tracking: wandb.yaml  # mlflow.yaml # set tracking here or use command line (e.g. `python train.py tracking=tensorboard`)
-  - training: lr_sync_trainer.yaml
+  - training: lr_dist_trainer_conf.yaml
   - log_dir: default.yaml
   # experiment configs allow for version control of specific configurations
   # e.g. hyperparameters for each combination of model and data
-  - experiment: null
+  # - experiment: null
   # debugging config (enable through command line, e.g. `python train.py debug=default)
   - debug: null
   # config for hyperparameter optimization
