@@ -145,3 +145,98 @@ def get_og_repr(weight: torch.Tensor, trans: bool, shp: torch.Size, reshape=Fals
             return
         else:
             return weight.reshape(shp)
+
+
+def get_2d_rep_w_1d_names(
+    model: nn.Module,
+    base_2d: torch.Tensor,
+    base_name: str,
+    names1d: dict,
+) -> tuple[torch.Tensor, dict]:
+    """Concatenates 1D tensors to a 2D base tensor along appropriate dimensions.
+
+    This function takes a base 2D tensor and a dictionary containing names of 1D
+    tensors. For each 1D tensor specified in `names1d[base_name]`, it identifies the
+    matching dimension in the base tensor and concatenates the 1D tensor along the
+    other dimension.
+
+    Args:
+        model (nn.Module): The PyTorch model containing the 1D weights.
+        base_2d (torch.Tensor): The 2D tensor to be expanded.
+        base_name (str): Key in the `names1d` dictionary specifying which 1D tensors to use.
+        names1d (dict): A dictionary mapping base names to lists of 1D tensor names.
+
+    Returns:
+        tuple[torch.Tensor, dict]:
+            * The modified 2D tensor with concatenated values.
+            * A dictionary mapping the names of the concatenated 1D tensors to their
+              corresponding concatenation dimensions.
+    """
+    # assume that base_2d is a torch tensor that is already 2D, and TS if not square
+    cat_dims = {}
+    for app_name in names1d[base_name]:
+        lp_weight = rgetattr(model, app_name)
+        # Find matching dimension in base_2d
+        same_dim = torch.nonzero(base_2d.shape == lp_weight.shape).flatten()[0].item()
+        other_dim = (same_dim + 1) % 2  # Calculate the other dimension for concatenation
+        base_2d = torch.cat([base_2d, lp_weight.unsqueeze(other_dim)], dim=same_dim)
+        cat_dims[app_name] = same_dim
+    return base_2d, cat_dims
+
+
+def get_1ds_from_2dcombi(catted2d: torch.Tensor, assoc_1dnames: list, cat_dims: dict) -> tuple[torch.Tensor, dict]:
+    """Extracts 1D tensors from a concatenated 2D tensor.
+
+    This function reverses the process of concatenation performed by
+    `get_2d_rep_w_1d_names`. It iterates over the associated 1D tensor names
+    and uses the concatenation dimensions stored in `cat_dims` to extract the
+    original 1D tensors.
+
+    Args:
+        catted2d (torch.Tensor): The concatenated 2D tensor.
+        assoc_1dnames (list): List of names of the associated 1D tensors.
+        cat_dims (dict): Dictionary mapping 1D tensor names to their concatenation dimensions.
+
+    Returns:
+        tuple[torch.Tensor, dict]:
+            * The remaining portion of the concatenated tensor after extraction.
+            * Dictionary containing the extracted 1D tensors, mapped to their names.
+    """
+    ret = {}
+    for n in reversed(assoc_1dnames):  # need to work from the outside in to get everything correctly
+        sl = [slice(None), slice(None)]
+        sl[cat_dims[n]] = -1
+        ret[n] = catted2d[sl]
+        sl[cat_dims[n]] = slice(-1)
+        catted2d = catted2d[sl]  # remove last dim from this one
+    return catted2d, ret
+
+
+def get_1d_associated_weights(model: torch.Tensor, names_to_ignore: list) -> dict:
+    """Get a dictionary which contains the 1D weights which occur after an ND weight
+    If the first layers of a network are 1D, they will be ignored.
+
+    The idea is that the layers after the first layer can be appended along the output dim of the layers.
+    The input layers are ignored because its unlikely that we can cat along the input dim
+
+    Args:
+        model (torch.Tensor): _description_
+        names_to_ignore (list): _description_
+
+    Returns:
+        dict: A dictionary mapping the names of multidimensional weights to lists
+              of associated 1D weight names.
+    """
+    join_dict = {}
+    last_miltidim_w = None
+
+    for n, p in model.named_parameters():
+        if n in names_to_ignore:
+            continue
+
+        if p.ndim > 1 and last_miltidim_w is not None:
+            last_miltidim_w = n
+            join_dict[n] = []
+        elif last_miltidim_w is not None and p.ndim == 1:
+            join_dict[last_miltidim_w].append(n)
+    return join_dict
