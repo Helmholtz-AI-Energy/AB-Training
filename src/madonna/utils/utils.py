@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import logging
 import re
+import time
 from functools import reduce, wraps
 from pathlib import Path
 from typing import Any, Callable, List, Tuple, Union
@@ -224,3 +225,24 @@ def rgetattr(obj, attr, *args):
         return getattr(obj, attr, *args)
 
     return reduce(_getattr, [obj] + attr.split("."))
+
+
+def reset_adam_state(optimizer, p):
+    """
+    reset the shapes of the Adam optimizer buffers to be the same shape as the model parameters
+
+    if `reset_buffers_zero`: reset the buffer to zero after reshaping it
+    """
+    # resettime = time.perf_counter()
+    # rank = 0 if not dist.is_initialized() else dist.get_rank()
+    # instead of resetting optimizer, slice off bits of the saved states
+
+    for group in optimizer.param_groups:
+        state = optimizer.state[p]
+        if len(list(state.keys())) > 0:
+            for k in ["exp_avg", "exp_avg_sq"]:
+                state[k] *= 0
+            if group["amsgrad"]:
+                state["max_exp_avg_sq"] *= 0
+    # if rank == 0:
+    #     log.info(f"Reset Optimizer time: {time.perf_counter() - resettime}")

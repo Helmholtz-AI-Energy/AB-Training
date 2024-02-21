@@ -40,6 +40,8 @@ from torchmetrics.classification import MulticlassF1Score, MulticlassPrecision, 
 import madonna
 import wandb
 
+from .lr_dist_trainer import LowRankSyncTrainer
+
 best_acc1 = 0
 log = logging.getLogger(__name__)
 
@@ -52,11 +54,15 @@ def main(config):  # noqa: C901
     # log.info("more stuff")
     # log.info("do i need more things?")
     # raise ValueError
+
+    # =========================================== logging / tracking init ========================
     for handler in log.parent.handlers:
         if isinstance(handler, logging.FileHandler):
             log_file = handler.baseFilename
     with open_dict(config):
         config["log_file_out"] = log_file
+        if config.tracking.logging_rank == "all":  #
+            config.tracking.logging_rank = config.rank
 
     wandb_run = False
     if config.tracker == "wandb":
@@ -70,7 +76,7 @@ def main(config):  # noqa: C901
             config.save_dir = madonna.utils.utils.increment_path(
                 Path(config.training.checkpoint_out_root) / config.name,
             )  # increment run
-        if config.rank == 0:
+        if config.rank == config.tracking.logging_rank:
             log.info(f"save_dir: {config.save_dir}")
 
         save_dir = Path(config.save_dir)
@@ -85,7 +91,12 @@ def main(config):  # noqa: C901
         wdir = None
     # results_file = save_dir / 'results.txt'
     # f = open(results_file, 'w')
-    wandb_logger = madonna.utils.tracking.WandbLogger(config) if config.rank == 0 and config.enable_tracking else None
+    if config.rank == config.tracking.tracking_rank and config.enable_tracking:
+        wandb_logger = madonna.utils.tracking.WandbLogger(config)
+    else:
+        wandb_logger = None
+
+    # =========================================== END logging / tracking init ========================
 
     if dist.is_initialized():
         gpu = dist.get_rank() % torch.cuda.device_count()  # only 4 gpus/node
@@ -96,7 +107,8 @@ def main(config):  # noqa: C901
         # log.info(f"available GPUS: {torch.cuda.device_count()}")
     torch.cuda.set_device(gpu)
     device = torch.device(f"cuda:{gpu}")
-    # -------- Random init settings --------------------------
+
+    # =========================================== Seed setting =======================================
     if config.seed is None:
         seed = random.randint(0, 4294967295)
         # seed = torch.seed()
@@ -107,11 +119,11 @@ def main(config):  # noqa: C901
 
     if config.training.init_method == "random":
         seed += config.rank
-    elif dist.is_initialized() and config.training.init_method in ["unified", "random-sigma", "ortho-sigma"]:
+    elif dist.is_initialized() and config.training.init_method in ["unified", "rand-sigma", "ortho-sigma"]:
         dist.broadcast(tseed, src=0)
     else:
         raise ValueError(
-            f"config.training.init_method should be one of [random, unified, random-sigma, ortho-sigma],"
+            f"config.training.init_method should be one of [random, unified, rand-sigma, ortho-sigma],"
             f" given: {config.training.init_method}",
         )
     seed = tseed.item()
@@ -122,30 +134,29 @@ def main(config):  # noqa: C901
     random.seed(seed)
     torch.manual_seed(seed)
 
-    # if config.rank == 0:
     log.info(f"Seed: {seed}, init method: {config.training.init_method}")
     if config.training.init_method == "random-simga":
         with open_dict(config):
-            config.training.fixing_method.random_simga = True
             config.training.seed = seed
-    # -------- End Random Seed init --------------------------
+    # =========================================== END Seed setting =======================================
 
     # print('before get model')
     model = madonna.utils.get_model(config)
     if not config.cpu_training:
         model.cuda(gpu)
-    if config.training.init_method.endswith("-sigma"):
-        madonna.utils.utils.modify_model_random_simgas(
-            model,
-            device=gpu,
-            mode="rand" if config.training.init_method == "random-sigma" else "ortho",
-        )
+
+    # if config.training.init_method.endswith("-sigma"):
+    #     madonna.utils.utils.modify_model_random_simgas(
+    #         model,
+    #         device=gpu,
+    #         mode="rand" if config.training.init_method == "random-sigma" else "ortho",
+    #     )
 
     # if config.training.sync_batchnorm and dist.is_initialized():
     #     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
 
     # if config.training.federated and config.baseline:
-    log.info("Using federated data scheme, model is not DDP")
+    # log.info("Using federated data scheme, model is not DDP")
     # elif config.baseline:
     #     model = DDP(model)  # , device_ids=[config.rank])
     #     log.info("using DDP baseline model")
@@ -154,29 +165,30 @@ def main(config):  # noqa: C901
     #     model = model_hold(model).to(device)
     #     log.info("using SVD model")
 
-    # if config.rank == 0:
-    #     print(model)
-
     # model_param_dict = madonna.lrsync.sync.get_param_dict_with_svds(model)
 
     criterion = madonna.utils.get_criterion(config)
     optimizer = madonna.utils.get_optimizer(config, model, lr=config.training.lr)
-    all_opts = {"normal": optimizer}
-    # # set optimizer for references for SVD model to reset shapes of state params
-    # if not config.baseline:
-    #     p_optim = hydra.utils.instantiate(config.training.p_optimizer)
-    #     all_opts["p"] = p_optim(model.parameters())
-    #     model.set_optimizers(optimizer_normal=optimizer, optimizer_p=all_opts["p"])
 
     dset_dict = madonna.utils.datasets.get_dataset(config)
     train_loader, train_sampler = dset_dict["train"]["loader"], dset_dict["train"]["sampler"]
     val_loader = dset_dict["val"]["loader"]
 
-    train_len = len(train_loader)
+    train_len = config.training.iterations_per_train
     scheduler, _ = madonna.utils.get_lr_schedules(config, optimizer, train_len)
 
-    # if not config.baseline:
-    #     model.set_epoch_length(train_len)
+    train_metrics = WrappedMetrics(epoch=0, len_loader=config.training.iterations_per_train)
+
+    trainer = LowRankSyncTrainer(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        device=device,
+        train_loader=train_loader,
+        lr_scheduler=scheduler,
+        config=config,
+        metrics=train_metrics,
+    )
 
     # optionally resume from a checkpoint
     # Reminder: when resuming from a single checkpoint, make sure to call init_model with
@@ -215,17 +227,10 @@ def main(config):  # noqa: C901
         else:
             print(f"=> no checkpoint found at: {config.training.checkpoint}")
 
-    # # if config['evaluate']:
-    # #     validate(val_loader, dlrt_trainer, config)
-    # #     return
+    # if config['evaluate']:
+    #     validate(val_loader, dlrt_trainer, config)
+    #     return
 
-    train_metrics = MetricCollection(
-        [
-            MulticlassF1Score(num_classes=config.data.classes),
-            MulticlassPrecision(num_classes=config.data.classes),
-            MulticlassRecall(num_classes=config.data.classes),
-        ],
-    ).to(device)
     val_metrics = MetricCollection(
         [
             MulticlassF1Score(num_classes=config.data.classes),
@@ -234,117 +239,45 @@ def main(config):  # noqa: C901
         ],
     ).to(device)
 
-    # ============= make first layer the same =================
-    # if config.training.init_method is not None:
-
-    # =========================================================
-    # print(model)
-
-    scaler = torch.cuda.amp.GradScaler(enabled=config.model.autocast)
     rank = dist.get_rank() if dist.is_initialized() else 0
 
-    refactory_warmup = None
-    len_train = len(train_loader)
     best_fitness = 0.0
     last_val_top1s = []
-    # TODO: flag for full_rank training
-    # model_param_dict = None
-    # if not config.baseline and model.local_low_rank_model is not None and dist.is_initialized():
-    #     log.info("partially syncing models from low rank")
-    #     model_param_dict = madonna.lrsync.sync.get_param_dict_with_svds(model)
-    #     madonna.lrsync.sync.sync_topn_singulars_oialr(
-    #         model_param_dict, vecs_to_send=config.training.sync.vecs, method=config.training.sync.method
-    #     )
-    # elif not config.baseline and dist.is_initialized():
-    #     log.info("partially syncing models in full rank")
-    #     madonna.lrsync.sync.sync_model_in_low_rank(model, config)
-    #     # madonna.lrsync.sync.sync_topn_singulars_oialr(model_param_dict, topn=10)
-
-    # if not config.baseline and model.local_low_rank_model is not None:
-    #     model.mix_svd_layers()
-
-    # just_synced = False
 
     for epoch in range(start_epoch, config.training["epochs"]):
         torch.cuda.reset_peak_memory_stats()
-        if config["rank"] == 0:
-            # console.rule(f"Begin epoch {epoch} LR: {optimizer.param_groups[0]['lr']}")
+        if config["rank"] == config.tracking.tracking_rank:
             lr_list, prnt_str = get_lrs(optimizer)
             log.info(f"Begin epoch {epoch} LRs: {prnt_str}")
             lrs = {"lr": lr_list[0]}
             if config.enable_tracking:
-                # wandb_logger.log(metrics, step=epoch * len_train)
                 wandb_logger.log(lrs)
         if dist.is_initialized() and config.data.distributed_sample and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        train_loss, last_loss, refactory_warmup, train_t1 = train(
-            train_loader=train_loader,
-            optimizers=all_opts,
-            model=model,
-            criterion=criterion,
-            epoch=epoch,
-            device=device,
-            config=config,
-            scaler=scaler,
-            lr_scheduler=scheduler,
-            refactory_warmup=refactory_warmup,
-            mixup=dset_dict["mixup"],
-            wandb_logger=wandb_logger,
-            metrics=train_metrics,
-        )
+        trainer.metrics.reset(epoch, trainer.iterations_per_train)
+        train_metrics, train_time = trainer.train()
 
-        # ------------------- old code to sync the layer weights (using fib and such) ------------------
-        # if (
-        #     not config.baseline
-        #     and model_param_dict is None
-        #     and model.local_low_rank_model is not None
-        #     and dist.is_initialized()
-        # ):
-        #     model_param_dict = madonna.lrsync.sync.get_param_dict_with_svds(model)
-        # if (
-        #     not config.baseline
-        #     and epoch >= config.training.sync.first_epoch
-        #     and epoch % config.training.sync.epoch_freq == 0
-        #     and dist.is_initialized()
-        # ):
-        #     if model_param_dict is not None:
-        #         madonna.lrsync.sync.sync_low_rank_model(
-        #             model_param_dict,
-        #             vecs_to_send=config.training.sync.vecs,
-        #             method=config.training.sync.method,
-        #             sort=config.training.sort,
-        #         )
-        #         pass
-        #         # madonna.models.utils.reset_opt_state(optimizer=optimizer)
-        #         # # self.reset_all_states(self.optimizer)
-        #         # # self.optimizer.reset_shapes_of_sigma(self)
-        #         # model.optimizer.zero_grad(set_to_none=True)
-        #     else:
-        #         madonna.lrsync.sync.sync_full_rank_model_in_low_rank(model, config)
-        #         pass
-        #     just_synced = True
-        # --------------- end old code to sync the layer weights (using fib and such) ------------------
-
-        if config.rank == 0:
-            log.info(f"Average Training loss across process space: {train_loss}")
-            par, zpar = 0, 0
-            for p in model.parameters():
-                par += p.numel()
-                zpar += (p.abs() < 1e-6).sum()
-            log.info(f"Network Sparsity: {zpar / par}, zeros: {zpar} nonzero: {par}")
+        ls = train_metrics["loss"].item() if isinstance(train_metrics["loss"], torch.Tensor) else train_metrics["loss"]
+        t1 = train_metrics["top1"].item() if isinstance(train_metrics["top1"], torch.Tensor) else train_metrics["top1"]
+        t5 = train_metrics["top5"].item() if isinstance(train_metrics["top5"], torch.Tensor) else train_metrics["top5"]
+        if rank == config.tracking.tracking_rank and config.enable_tracking:
+            wandb_logger.log(
+                {
+                    "train/loss": ls,
+                    "train/top1": t1,
+                    "train/top5": t5,
+                    "train/time": train_time,
+                },
+            )
         # evaluate on validation set
         val_top1, val_loss = validate(
             val_loader=val_loader,
-            model=model,
+            model=trainer.model_to_run,
             criterion=criterion,
             config=config,
-            epoch=epoch,
             device=device,
-            print_on_rank=True,  # config.rank == 0,
-            pg=None,
-            len_train=len_train,
-            wandb_logger=wandb_logger,
+            wandb_logger=wandb_logger if config.enable_tracking else None,
             metrics=val_metrics,
         )
 
@@ -352,16 +285,10 @@ def main(config):  # noqa: C901
         #     log.info(
         #         f"Average val loss across process space: {val_loss} " f"-> diff: {train_loss - val_loss}",
         #     )
-        if epoch % config.training.federated_args.compare_epoch_freq == 0 or epoch == config.training.epochs - 1:
-            madonna.utils.basis.compare_bases(model, baseline=True)
 
         # log metrics
-        # train_metrics_epoch = train_metrics.compute()
         val_metrics_epoch = val_metrics.compute()
         log_dict = {
-            # "train/f1": train_metrics_epoch["MulticlassF1Score"],
-            # "train/precision": train_metrics_epoch["MulticlassPrecision"],
-            # "train/recall": train_metrics_epoch["MulticlassRecall"],
             # "train/loss": train_loss,
             "val/f1": val_metrics_epoch["MulticlassF1Score"],
             "val/precision": val_metrics_epoch["MulticlassPrecision"],
@@ -373,23 +300,24 @@ def main(config):  # noqa: C901
         if dist.is_initialized():
             wait = dist.barrier(async_op=True)
 
-        log.info(
-            f"Epoch end metrics: \n\t"
-            # f"train f1/prec/rec: {log_dict['train/f1']:.4f} / "
-            # f"{log_dict['train/precision']:.4f} / {log_dict['train/recall']:.4f}"
-            f"val f1/prec/rec: {log_dict['val/f1']:.4f} / "
-            f"{log_dict['val/precision']:.4f} / {log_dict['val/recall']:.4f}",
-        )
+        if rank == config.tracking.logging_rank:
+            log.info(
+                f"Epoch end metrics: "
+                # f"train f1/prec/rec: {log_dict['train/f1']:.4f} / "
+                # f"{log_dict['train/precision']:.4f} / {log_dict['train/recall']:.4f}"
+                f"val f1/prec/rec: {log_dict['val/f1']:.4f} / "
+                f"{log_dict['val/precision']:.4f} / {log_dict['val/recall']:.4f}",
+            )
 
         ckpt = {
             "epoch": epoch,
             "best_fitness": best_fitness,
             # 'training_results': results_file.read_text(),
             "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            # "optimizer": optimizer.state_dict(),  TODO: FIXME!!!!
         }
 
-        if rank == 0 and config.enable_tracking:
+        if rank == config.tracking.tracking_rank and config.enable_tracking:
             last_val_top1s.append(val_top1.item() if isinstance(val_top1, torch.Tensor) else val_top1)
             if len(last_val_top1s) > 10:
                 slope, _ = np.polyfit(x=np.arange(10), y=np.array(last_val_top1s[-10:]), deg=1)
@@ -398,13 +326,12 @@ def main(config):  # noqa: C901
             if val_top1 > best_fitness:
                 best_fitness = val_top1
 
-            # print(train_metrics_epoch)
             wandb_logger.log(log_dict)
             wandb_logger.end_epoch(best_result=best_fitness == val_top1)
 
             ckpt["wandb_id"] = (wandb_logger.wandb_run.id if wandb_logger.wandb else None,)
             # Save last, best and delete
-        if wdir is not None:  # TODO: saving from ALL ranks here
+        if wdir is not None and config.training.save_checkpoints:  # TODO: saving from ALL ranks here
             torch.save(ckpt, last)
             # if best_fitness == val_top1:
             #     torch.save(ckpt, best)
@@ -422,18 +349,6 @@ def main(config):  # noqa: C901
             # elif epoch >= (config.training.epochs - 5):
             #     torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
 
-            # if wandb_logger.wandb and config.enable_tracking:
-            #     if (
-            #         (epoch + 1) % config.training.save_period == 0 and not epoch == config.training.epochs - 1
-            #     ) and config.training.save_period != -1:
-            #         wandb_logger.log_model(
-            #             last.parent,
-            #             config,
-            #             epoch,
-            #             val_top1,
-            #             best_model=best_fitness == val_top1,
-            #         )
-            #         print("After wandb log model")
             del ckpt
         if dist.is_initialized():
             # wait here for the saving and such...it didnt work to have it afterwards
@@ -447,12 +362,9 @@ def main(config):  # noqa: C901
         #     if rank == 0:
         #         log.info("Early stopping")
         #     break
-        # set up next epoch after saving everything
-        # wandb.log({"epoch": epoch}, step=(epoch + 1) * len_train)
         scheduler.step(epoch + 1, metric=val_loss)
-        train_metrics.reset()
         val_metrics.reset()
-    if rank == 0:
+    if rank == config.tracking.tracking_rank and config.enable_tracking:
         log.info("End of run")
         wandb_logger.finish_run()
     # import json
@@ -479,164 +391,8 @@ def get_lrs(opt):
     return out_lrs, prnt_str
 
 
-def train(
-    train_loader,
-    optimizers: dict,
-    model,
-    criterion,
-    epoch,
-    device,
-    config,
-    wandb_logger,
-    metrics,
-    lr_scheduler=None,
-    scaler=None,
-    log=log,
-    refactory_warmup=None,
-    mixup=None,
-):
-    train_time0 = time.perf_counter()
-    batch_time = AverageMeter("Time", ":6.3f")
-    data_time = AverageMeter("Data", ":6.3f")
-    losses = AverageMeter("Loss", ":.4f")
-    top1 = AverageMeter("Acc@1", ":6.2f")
-    top5 = AverageMeter("Acc@5", ":6.2f")
-    progress = ProgressMeter(
-        len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
-        prefix=f"Epoch: [{epoch}]",
-    )
-    # switch to train mode
-    model.train()
-    if refactory_warmup is None:
-        refactory_warmup = {}
-
-    end = time.time()
-    updates_per_epoch = len(train_loader)
-    num_updates = epoch * updates_per_epoch
-    tsync = 0
-    for opt in optimizers:
-        optimizers[opt].zero_grad(set_to_none=True)
-    optimizer = optimizers["normal"]
-    for i, data in enumerate(train_loader):
-        # optimizers['normal'].zero_grad(set_to_none=True)
-        if hasattr(config.data, "dali") and config.data.dali:
-            images = data[0]["data"]
-            target = data[0]["label"].squeeze(-1).long()
-        else:
-            images = data[0]
-            target = data[1]
-        if mixup is not None:
-            images, target = mixup(images, target)
-        # measure data loading time
-        data_time.update(time.time() - end)
-
-        # move data to the same device as model
-        images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
-
-        # if config.rank == 0 and i % 4 == 0:
-        #     _, lrs = optimizer.get_lrs()
-        #     print(f"LRS: {lrs}")
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=config.model.autocast):
-            # NOTE: some things dont play well with autocast - one should not put anything aside from the model in here
-            if not config.baseline:
-                output, optimizer = model(images)
-            else:
-                output = model(images)
-            loss = criterion(output, target)
-
-        if torch.isnan(loss):
-            for n, p in model.named_parameters():
-                print(f"{n}: {p.mean():.4f}, {p.min():.4f}, {p.max():.4f}, {p.std():.4f}")
-            raise ValueError("NaN loss")
-        scaler.scale(loss).backward()
-
-        if config.training.max_grad_norm > 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
-        scaler.step(optimizer)
-        scaler.update()
-
-        optimizer.zero_grad(set_to_none=True)
-
-        acc1, acc5 = accuracy(output, target, topk=(1, 5), mixup=mixup is not None)
-        losses.update(loss.item(), images.size(0))
-        try:
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-        except IndexError:
-            top1.update(acc1, images.size(0))
-            top5.update(acc5, images.size(0))
-        # metrics.update(output, target)
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-        num_updates += 1
-        # if steps_remaining > 0:
-        #     for c, group in enumerate(optimizer.param_groups):
-        #         group["lr"] += step_factors[c]
-        #     # steps_remaining = lr_reset_steps - 1
-        # else:
-        #     # TODO: this will only work for timm schedulers
-
-        # # ------ update the non-svd parameters ----------
-        # if not config.baseline and (i % config.training.non_svd_freq == 0 or i == updates_per_epoch - 1):
-        #     # if config.rank == 0:
-        #     #     log.info("Starting non-svd sync")
-        #     tsync1 = time.perf_counter()
-        #     model.sync_nonsvd_params(nonblocking=False, waits=None)
-        #     tsync += time.perf_counter() - tsync1
-
-        lr_scheduler.step_update(num_updates=num_updates, metric=loss)
-
-        # if argmax.std() == 0:
-        #     log.error(f"ISSUE WITH NETWORK printing debugging info")
-        #     for n, p in model.named_parameters():
-        #         print(f"{n}: {p.mean():.4f}, {p.min():.4f}, {p.max():.4f}, {p.std():.4f}")
-        #     raise ValueError
-        argmax = torch.argmax(output, dim=1).to(torch.float32)
-
-        if i % config.training.print_freq == 0 or i == len(train_loader) - 1:  # and config["rank"] == 0:
-            argmax = torch.argmax(output, dim=1).to(torch.float32)
-            log.info(
-                f"Argmax outputs s "
-                f"mean: {argmax.mean().item():.5f}, max: {argmax.max().item():.5f}, "
-                f"min: {argmax.min().item():.5f}, std: {argmax.std().item():.5f}",
-            )
-            progress.display(i + 1, log=log)
-
-        optimizer.zero_grad()
-
-    if config.rank == 0:
-        log.info(f"Data Loading Time avg: {data_time.avg}")
-        if not config.baseline:
-            log.info(f"Average non-svd sync time: {tsync / updates_per_epoch}\t Total: {tsync}")
-
-    # if dist.is_initialized():
-    #     losses.all_reduce()
-    #     top1.all_reduce()
-    #     top5.all_reduce()
-
-    t1 = top1.avg.item() if isinstance(top1.avg, torch.Tensor) else top1.avg
-    if config["rank"] == 0 and config.enable_tracking:
-        ls = losses.avg.item() if isinstance(losses.avg, torch.Tensor) else losses.avg
-        t1 = top1.avg.item() if isinstance(top1.avg, torch.Tensor) else top1.avg
-        t5 = top5.avg.item() if isinstance(top5.avg, torch.Tensor) else top5.avg
-        wandb_logger.log(
-            {
-                "train/loss": ls,
-                "train/top1": t1,
-                "train/top5": t5,
-                "train/time": time.perf_counter() - train_time0,
-            },
-        )
-    return losses.avg, loss, refactory_warmup, t1
-
-
 @torch.no_grad()
-def validate(val_loader, model, criterion, config, epoch, device, print_on_rank, pg, len_train, wandb_logger, metrics):
+def validate(val_loader, model, criterion, config, device, wandb_logger, metrics):
     def run_validate(loader, base_progress=0):
         # rank = 0 if not dist.is_initialized() else dist.get_rank()
         with torch.no_grad():
@@ -683,21 +439,9 @@ def validate(val_loader, model, criterion, config, epoch, device, print_on_rank,
                     for n, p in model.named_parameters():
                         print(f"{n}: {p.mean():.4f}, {p.min():.4f}, {p.max():.4f}, {p.std():.4f}")
                     raise ValueError("NaN loss - VAL")
-                # argmax = torch.argmax(output, dim=1).to(torch.float32)
-                # # print(
-                # #     f"output mean: {argmax.mean().item()}, max: {argmax.max().item()}, ",
-                # #     f"min: {argmax.min().item()}, std: {argmax.std().item()}",
-                # # )
-                # # progress.display(i + 1, log=log)
-
-                # if argmax.std() == 0:
-                #     log.error(f"ISSUE WITH NETWORK printing debugging info")
-                #     for n, p in model.named_parameters():
-                #         print(f"{n}: {p.mean():.4f}, {p.min():.4f}, {p.max():.4f}, {p.std():.4f}")
-                #     raise ValueError
 
                 # if (i % config.training.print_freq == 0 or i == num_elem) and print_on_rank:
-                if (i % 50 == 0 or i == num_elem) and print_on_rank:
+                if (i % 50 == 0 or i == num_elem) and config.tracking.logging_rank == config.rank:
                     argmax = torch.argmax(output, dim=1).to(torch.float32)
                     print(
                         f"output mean: {argmax.mean().item()}, max: {argmax.max().item()}, ",
@@ -705,18 +449,11 @@ def validate(val_loader, model, criterion, config, epoch, device, print_on_rank,
                     )
                     progress.display(i + 1, log=log)
 
-                    # if argmax.std() == 0:
-                    #     log.error(f"ISSUE WITH NETWORK printing debugging info")
-                    #     for n, p in model.named_parameters():
-                    #         print(f"{n}: {p.mean():.4f}, {p.min():.4f},
-                    #         {p.max():.4f}, {p.std():.4f}")
-                    #     raise ValueError
-
-    batch_time = AverageMeter("Time", ":6.3f", Summary.NONE, pg=pg)
-    data_time = AverageMeter("Data", ":6.3f", Summary.NONE, pg=pg)
-    losses = AverageMeter("Loss", ":.4f", Summary.AVERAGE, pg=pg)
-    top1 = AverageMeter("Acc@1", ":6.2f", Summary.AVERAGE, pg=pg)
-    top5 = AverageMeter("Acc@5", ":6.2f", Summary.AVERAGE, pg=pg)
+    batch_time = AverageMeter("Time", ":6.3f", Summary.NONE)
+    data_time = AverageMeter("Data", ":6.3f", Summary.NONE)
+    losses = AverageMeter("Loss", ":.4f", Summary.AVERAGE)
+    top1 = AverageMeter("Acc@1", ":6.2f", Summary.AVERAGE)
+    top5 = AverageMeter("Acc@5", ":6.2f", Summary.AVERAGE)
     progress = ProgressMeter(
         len(val_loader) + (len(val_loader.sampler) * config["world_size"] < len(val_loader.dataset)),
         [batch_time, losses, top1, top5],
@@ -725,10 +462,6 @@ def validate(val_loader, model, criterion, config, epoch, device, print_on_rank,
 
     # switch to evaluate mode
     model.eval()
-    # if epoch == 5:
-    #     for n, p in model.named_parameters():
-    #         print(f"{n}: {p.mean():.4f}, {p.min():.4f}, {p.max():.4f}, {p.std():.4f}")
-    #     raise ValueError
     vt1 = time.perf_counter()
     run_validate(val_loader)
 
@@ -747,14 +480,14 @@ def validate(val_loader, model, criterion, config, epoch, device, print_on_rank,
         run_validate(aux_val_loader, len(val_loader))
     val_time_total = time.perf_counter() - vt1
 
-    # if dist.is_initialized():
-    #     losses.all_reduce()
-    #     top1.all_reduce()
-    #     top5.all_reduce()
+    if dist.is_initialized():
+        losses.all_reduce()
+        top1.all_reduce()
+        top5.all_reduce()
 
-    progress.display_summary(log=log, printing_rank=print_on_rank)
+    progress.display_summary(log=log, printing_rank=config.tracking.logging_rank)
 
-    if config["rank"] == 0 and config.enable_tracking:
+    if config["rank"] == config.tracking.tracking_rank and config.enable_tracking:
         ls = losses.avg.item() if isinstance(losses.avg, torch.Tensor) else losses.avg
         t1 = top1.avg.item() if isinstance(top1.avg, torch.Tensor) else top1.avg
         t5 = top5.avg.item() if isinstance(top5.avg, torch.Tensor) else top5.avg
@@ -765,18 +498,10 @@ def validate(val_loader, model, criterion, config, epoch, device, print_on_rank,
                 "val/top5": t5,
                 "val/total_time": val_time_total,
             },
-            # step=(epoch + 1) * len_train,
         )
-        # mlflow.log_metrics(
-        #     metrics={
-        #         "val loss": ls,
-        #         "val top1": t1,
-        #         "val top5": t5,
-        #     },
-        #     step=epoch,
-        # )
-    if config.rank == 0:
+    if config.rank == config.tracking.logging_rank:
         log.info(f"Data loading time avg: {data_time.avg}")
+        log.info(f"End Val avgs: Loss: {losses.avg:.4f} Top1: {top1.avg:.4f} Top5: {top5.avg:.4f}")
 
     return top1.avg, losses.avg
 
@@ -785,6 +510,49 @@ def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, "model_best.pth.tar")
+
+
+class WrappedMetrics:
+    def __init__(self, epoch, len_loader) -> None:
+        self.reset(epoch, len_loader)
+
+    def reset(self, epoch, len_loader):
+        self.batch_time = AverageMeter("Time", ":6.3f")
+        self.data_time = AverageMeter("Data", ":6.3f")
+        self.losses = AverageMeter("Loss", ":.4f")
+        self.top1 = AverageMeter("Acc@1", ":6.2f")
+        self.top5 = AverageMeter("Acc@5", ":6.2f")
+        self.progress = ProgressMeter(
+            len_loader,
+            [self.batch_time, self.data_time, self.losses, self.top1, self.top5],
+            prefix=f"Epoch: [{epoch}]",
+        )
+
+    def __call__(self, outputs, labels, loss, sz):
+        acc1, acc5 = accuracy(outputs, labels, topk=(1, 5))
+        self.losses.update(loss.item(), sz)
+        try:
+            self.top1.update(acc1[0], sz)
+            self.top5.update(acc5[0], sz)
+        except IndexError:
+            self.top1.update(acc1, sz)
+            self.top5.update(acc5, sz)
+
+    def display(self, i, output=None):
+        if output is not None:
+            argmax = torch.argmax(output, dim=1).to(torch.float32)
+            log.info(
+                f"Argmax outputs s "
+                f"mean: {argmax.mean().item():.5f}, max: {argmax.max().item():.5f}, "
+                f"min: {argmax.min().item():.5f}, std: {argmax.std().item():.5f}",
+            )
+        self.progress.display(i + 1, log=log)
+
+    def compute(self):
+        self.losses.all_reduce()
+        self.top1.all_reduce()
+        self.top5.all_reduce()
+        return {"loss": self.losses.avg, "top1": self.top1.avg, "top5": self.top5.avg}
 
 
 class Summary(Enum):

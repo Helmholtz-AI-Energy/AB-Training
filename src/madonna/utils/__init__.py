@@ -6,7 +6,7 @@ import torch.optim
 from omegaconf import open_dict
 from timm.scheduler import create_scheduler
 
-from . import basis, comm, data_samplers, datasets, tracking
+from . import basis, comm, data_samplers, datasets, mixing, tracking
 from .utils import *
 
 
