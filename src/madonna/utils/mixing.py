@@ -1,6 +1,6 @@
 import torch
 
-from .basis import get_2d_repr, get_og_repr
+from .basis import get_2d_repr
 
 
 def mix_sigma(u, s, vh, method: str = "exp", generator=None, *args, **kwargs):
@@ -117,6 +117,9 @@ def shuffle_update_usvh_mix_sigma(u=None, s=None, vh=None, weight=None):
         s.zero_()
         s.add_(s)
     else:
-        new_w = get_og_repr(u @ sig.diag() @ vh, trans, shp)
+        new_w = u @ sig.diag() @ vh
+        if trans:
+            new_w = new_w.T
+        new_w = new_w.view(shp)
         weight.zero_()
         weight.add_(new_w)
