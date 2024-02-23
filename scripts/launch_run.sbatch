@@ -42,7 +42,7 @@ SRUN_PARAMS=(
   #--cpu-bind="ldoms"
   --gpu-bind="closest"
   --label
-  --container-name=torch2.1.2
+  --container-name=torch2.2.0
   --container-writable
   --container-mount-home
   --container-mounts="${TOMOUNT}"

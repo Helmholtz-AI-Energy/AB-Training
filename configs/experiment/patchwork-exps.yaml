@@ -7,7 +7,7 @@ training:
 
   # number of validation steps to execute at the beginning of the training
   # num_sanity_val_steps: 0
-  trainer: "lr_dist_train"
+  trainer: "patchwork_trainer"
   # ckpt path
   checkpoint: null # /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models/baseine/vit_b_16-imagenet/epoch43.pth.tar #
   checkpoint_out_root: null  #/hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models
@@ -21,11 +21,10 @@ training:
     min_lr: 0.00001  # min LR of cosine annealing pattern
     warmup_lr: 0.00001  # starting point of warmup
 
-  init_method: ortho-sigma  # options: random, unified, random-sigma, ortho-sigma
-  syncing:
+  init_method: rand-sigma  # options: random, unified, rand-sigma, ortho-sigma
+  patchwork_svd:
     warmup_steps: 0
-    # sync_freq: 100
-    steps_btw_syncing: 250
+    steps_btw_syncing: 1000
     names_to_always_sync: null
       # - fc.weight
       # - fc.bias
@@ -33,15 +32,19 @@ training:
       # - cls_token
       # - pos_embed
       # - head.weight
+    comm_method: one-to-all
+    comm_kwargs:
+      percent_to_send: 0.25
+    cat1d: False
 
 
 data:
-  timm_transforms: False
+  timm_transforms: True
   local_batch_size: 1024
 
 tracking:
   logging_rank: 0
 
-name: only-sigma-sync-1024
+name: pw-one-all-rand-sigma-1024
 enable_tracking: False
 baseline: True

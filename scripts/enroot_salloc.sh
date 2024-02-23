@@ -55,7 +55,7 @@ then
     -N "${SLURM_NNODES}" \
     --time "${TIMELIMIT}" \
     --gres gpu:"${GPUS_PER_NODE}" \
-    --container-name=torch2.1.2 \
+    --container-name=torch2.2.0 \
     --container-mounts="${TOMOUNT}" \
     --container-mount-home \
     --container-writable \
@@ -72,7 +72,7 @@ then
     -N "${SLURM_NNODES}" \
     --time "${TIMELIMIT}" \
     --gres gpu:"${GPUS_PER_NODE}" \
-    --container-name=torch2.1.2 \
+    --container-name=torch2.2.0 \
     --container-mounts="${TOMOUNT}" \
     --container-mount-home \
     --container-writable

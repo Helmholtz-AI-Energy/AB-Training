@@ -66,6 +66,9 @@ class PatchworkSVDTrainer(BasicTrainer):
                     self.names_not_sync_in_indiv.append(n)
 
         self.comm_method = config.training.patchwork_svd.comm_method
+        if self.comm_method in ["partner", "one-to-all"]:
+            self.comm_percent_to_send = config.training.patchwork_svd.comm_kwargs.percent_to_send
+            self.comm_generator = torch.Generator().manual_seed(123456)  # no device -> use cpu
 
         self.local_model = self.model
 
@@ -85,7 +88,7 @@ class PatchworkSVDTrainer(BasicTrainer):
 
         # start in warmup mode (standard global DDP)
         self.no_ddp = False
-        if self.warmup_steps > 0 and len(self.names_to_always_sync) == 0:
+        if self.warmup_steps > 0 and len(self.names_to_always_sync) != 0:
             ddp_model = DDP(self.model)
             self.no_ddp = True
 
@@ -111,7 +114,7 @@ class PatchworkSVDTrainer(BasicTrainer):
                         p.zero_()
                         p.add_(hld)
 
-        if self.warmup_steps > 0 and len(self.names_to_always_sync) == 0:
+        if self.warmup_steps > 0 and len(self.names_to_always_sync) != 0:
             self.model_to_run = ddp_model  # ddp on all ranks
 
     @torch.no_grad()
@@ -121,8 +124,23 @@ class PatchworkSVDTrainer(BasicTrainer):
         #   partner - trade lowest USVh portions with highest from the partner (one partner for everything, diff partners each time)
         #   all-to-all - new weight matrix build from TOP USVh portions from all (equal contributions)
         #   one-to-all - replace the lowest N on all ranks with the top USVh portion of ONE rank
+        tsync = time.perf_counter()
+        if self.comm_method == "partner":
+            # need generator
+            # need partners
+            partners = torch.randperm(self.world_size, generator=self.comm_generator).view(self.world_size // 2, 2)
+            mypair = partners[torch.any(self.rank == partners, dim=1)]
+            mypartner = mypair[mypair != self.rank].item()
+            self._partner_sync(partner=mypartner, percent_to_send=self.comm_percent_to_send)
 
-        pass
+            log.info(f"Partner sync: partner -> {mypartner}, time: {time.perf_counter() - tsync}")
+        elif self.comm_method == "all-to-all":
+            self._all_to_all_sync()
+            log.info(f"All equal shares sync. time: {time.perf_counter() - tsync}")
+        elif self.comm_method == "one-to-all":
+            root = torch.randint(self.world_size, (1,), generator=self.comm_generator).item()
+            self._one_to_all_sync(root=root, percent_to_send=self.comm_percent_to_send)
+            log.info(f"One to all sync: root -> {root}, time: {time.perf_counter() - tsync}")
 
     @torch.no_grad()
     def _partner_sync_cat1d(self, partner: int, percent_to_send: float):
@@ -149,15 +167,15 @@ class PatchworkSVDTrainer(BasicTrainer):
                 model=self.model,
                 base_2d=base_2d_repr,
                 base_name=n,
-                names1d=self.names_to_cat1d[n],
+                names1d=self.names_to_cat1d,
             )
             self.cat1d_dims[n] = cat_names_n
             u, s, vh = torch.linalg.svd(catted, full_matrices=False)
             # need buffer for u, s, and vh comms
             num_to_send = int(s.shape[0] * percent_to_send)
-            send_u = u[:num_to_send].clone()
-            send_s = s[:num_to_send].clone()
-            send_vh = vh[:, :num_to_send].clone()
+            send_u = u[:num_to_send].contiguous()
+            send_s = s[:num_to_send].contiguous()
+            send_vh = vh[:, :num_to_send].contiguous()
 
             recv_u, recv_s, recv_vh = torch.zeros_like(send_u), torch.zeros_like(send_s), torch.zeros_like(send_vh)
 
@@ -169,6 +187,7 @@ class PatchworkSVDTrainer(BasicTrainer):
             recv_vh_op = dist.P2POp(dist.irecv, recv_vh, partner, tag=tag + 5)
             tag += 6
             waits = dist.batch_isend_irecv([send_u_op, recv_u_op, send_s_op, recv_s_op, send_vh_op, recv_vh_op])
+            waits[0].wait()
 
             # my_usvh[n] = {'u': u, 's': s, 'vh': vh, "trans": trans, "shp": shp, "waits": waits}
             # TODO: best way to distribute the workload here? 2 for loops to allow comes to finish?
@@ -176,14 +195,14 @@ class PatchworkSVDTrainer(BasicTrainer):
             # for n in self.names_to_cat1d:
 
             # u
-            waits[0].wiat()
-            waits[1].wait()
+            # waits[0].wait()
+            # waits[1].wait()
             u[-num_to_send:] = recv_u
-            waits[2].wiat()
-            waits[3].wait()
+            # waits[2].wait()
+            # waits[3].wait()
             s[-num_to_send:] = recv_s
-            waits[4].wiat()
-            waits[5].wait()
+            # waits[4].wait()
+            # waits[5].wait()
             vh[:, -num_to_send:] = recv_vh
             # undo 1d concatenating
             base_2d_repr, one_d_params = basis.get_1ds_from_2dcombi(
@@ -195,12 +214,14 @@ class PatchworkSVDTrainer(BasicTrainer):
                 param = utils.rgetattr(self.model, n1d)
                 param.zero_()
                 param.add_(one_d_params[n1d])
+                # utils.reset_adam_state(self.optimizer, param)
             # set ND param
             if trans:
                 base_2d_repr = base_2d_repr.T
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
+            # utils.reset_adam_state(self.optimizer, base_2d_repr)
 
     @torch.no_grad()
     def _partner_sync_no_cat1d(self, partner: int, percent_to_send: float):
@@ -219,16 +240,16 @@ class PatchworkSVDTrainer(BasicTrainer):
         # TODO: check memory hit, might be very high if keeping all the USVh mats
         # my_usvh = {}
         tag = 0
-        for n, base_weight in self.model.named_parameters:
-            if base_weight.ndim < 2:
+        for n, base_weight in self.model.named_parameters():
+            if base_weight.squeeze().ndim < 2:
                 continue
             base_2d_repr, trans, shp = basis.get_2d_repr(base_weight)
             u, s, vh = torch.linalg.svd(base_2d_repr, full_matrices=False)
             # need buffer for u, s, and vh comms
             num_to_send = int(s.shape[0] * percent_to_send)
-            send_u = u[:num_to_send].clone()
-            send_s = s[:num_to_send].clone()
-            send_vh = vh[:, :num_to_send].clone()
+            send_u = u[:num_to_send].contiguous()
+            send_s = s[:num_to_send].contiguous()
+            send_vh = vh[:, :num_to_send].contiguous()
 
             recv_u, recv_s, recv_vh = torch.zeros_like(send_u), torch.zeros_like(send_s), torch.zeros_like(send_vh)
 
@@ -240,6 +261,12 @@ class PatchworkSVDTrainer(BasicTrainer):
             recv_vh_op = dist.P2POp(dist.irecv, recv_vh, partner, tag=tag + 5)
             tag += 6
             waits = dist.batch_isend_irecv([send_u_op, recv_u_op, send_s_op, recv_s_op, send_vh_op, recv_vh_op])
+            # c = 0
+            for w in waits:
+                w.wait()
+                # c += 1
+            # print(c)
+            assert torch.all(recv_vh != 0.0), "No sending..."
 
             # my_usvh[n] = {'u': u, 's': s, 'vh': vh, "trans": trans, "shp": shp, "waits": waits}
             # TODO: best way to distribute the workload here? 2 for loops to allow comes to finish?
@@ -247,14 +274,14 @@ class PatchworkSVDTrainer(BasicTrainer):
             # for n in self.names_to_cat1d:
 
             # u
-            waits[0].wiat()
-            waits[1].wait()
+            # waits[0].wait()
+            # waits[1].wait()
             u[-num_to_send:] = recv_u
-            waits[2].wiat()
-            waits[3].wait()
+            # waits[2].wait()
+            # waits[3].wait()
             s[-num_to_send:] = recv_s
-            waits[4].wiat()
-            waits[5].wait()
+            # waits[4].wait()
+            # waits[5].wait()
             vh[:, -num_to_send:] = recv_vh
             # undo 1d concatenating
             base_2d_repr = u @ s.diag() @ vh
@@ -264,6 +291,7 @@ class PatchworkSVDTrainer(BasicTrainer):
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
+            # utils.reset_adam_state(self.optimizer, base_weight)
 
     @torch.no_grad()
     def _partner_sync(self, partner: int, percent_to_send: float):
@@ -295,7 +323,7 @@ class PatchworkSVDTrainer(BasicTrainer):
                 model=self.model,
                 base_2d=base_2d_repr,
                 base_name=n,
-                names1d=self.names_to_cat1d[n],
+                names1d=self.names_to_cat1d,
             )
             self.cat1d_dims[n] = cat_names_n
             u, s, vh = torch.linalg.svd(catted, full_matrices=False)
@@ -310,9 +338,12 @@ class PatchworkSVDTrainer(BasicTrainer):
             u.zero_()
             s.zero_()
             vh.zero_()
-            u[start:stop] = u_sel
-            s[start:stop] = s_sel
-            vh[start:stop] = vh_sel
+            u[start:stop] += u_sel
+            s[start:stop] += s_sel
+            vh[:, start:stop] += vh_sel
+            u = u.contiguous()
+            s = s.contiguous()
+            vh = vh.contiguous()
 
             wait_u = dist.all_reduce(u, async_op=True)
             wait_s = dist.all_reduce(s, async_op=True)
@@ -331,20 +362,23 @@ class PatchworkSVDTrainer(BasicTrainer):
                 param = utils.rgetattr(self.model, n1d)
                 param.zero_()
                 param.add_(one_d_params[n1d])
+                # utils.reset_adam_state(self.optimizer, param)
             # set ND param
             if trans:
                 base_2d_repr = base_2d_repr.T
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
+            # utils.reset_adam_state(self.optimizer, base_2d_repr)
 
     @torch.no_grad()
     def _all_to_all_sync_no_cat1d(self):
         # in this sync, all procs give them same number of ranks, last ones are set to zero and ignored??
 
         # TODO: check memory hit, might be very high if keeping all the USVh mats
-        for n in self.names_to_cat1d:
-            base_weight = utils.rgetattr(self.model, n)
+        for n, base_weight in self.model.named_parameters():
+            if base_weight.squeeze().ndim < 2:
+                continue
             base_2d_repr, trans, shp = basis.get_2d_repr(base_weight)
             u, s, vh = torch.linalg.svd(base_2d_repr, full_matrices=False)
             # this one will use USVh in place and will just move things around
@@ -357,9 +391,13 @@ class PatchworkSVDTrainer(BasicTrainer):
             u.zero_()
             s.zero_()
             vh.zero_()
-            u[start:stop] = u_sel
-            s[start:stop] = s_sel
-            vh[start:stop] = vh_sel
+            u[start:stop] += u_sel
+            s[start:stop] += s_sel
+            vh[:, start:stop] += vh_sel
+
+            u = u.contiguous()
+            s = s.contiguous()
+            vh = vh.contiguous()
 
             wait_u = dist.all_reduce(u, async_op=True)
             wait_s = dist.all_reduce(s, async_op=True)
@@ -376,6 +414,7 @@ class PatchworkSVDTrainer(BasicTrainer):
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
+            # utils.reset_adam_state(self.optimizer, base_weight)
 
     @torch.no_grad()
     def _all_to_all_sync(self):
@@ -389,6 +428,148 @@ class PatchworkSVDTrainer(BasicTrainer):
             self._all_to_all_sync_cat1d()
         else:
             self._all_to_all_sync_no_cat1d()
+
+        for w in waits:
+            w.wait()
+
+    @torch.no_grad()
+    def _one_to_all_sync_cat1d(self, root: int, percent_to_send: float):
+        # send a percentage of one rank to all the others
+
+        # trading is on dim0 for U and V (making it dim1 for Vh)
+
+        # steps:
+        #   1. get 2d reps (if 1d, go through that)
+        #   2. get amount to send + send nonblocking, U will take longest, but with all the SVDs, it probably doesnt matter
+        #   3. recv from partner, create new USVh
+        #   4. set new USVh to model
+        if percent_to_send > 1:
+            raise ValueError(f"Percent to send must be < 1 -> {percent_to_send}")
+
+        # TODO: check memory hit, might be very high if keeping all the USVh mats
+        for n in self.names_to_cat1d:
+            base_weight = utils.rgetattr(self.model, n)
+            base_2d_repr, trans, shp = basis.get_2d_repr(base_weight)
+            catted, cat_names_n = basis.get_2d_rep_w_1d_names(
+                model=self.model,
+                base_2d=base_2d_repr,
+                base_name=n,
+                names1d=self.names_to_cat1d,
+            )
+            self.cat1d_dims[n] = cat_names_n
+            u, s, vh = torch.linalg.svd(catted, full_matrices=False)
+            # need buffer for u, s, and vh comms
+            num_to_send = int(s.shape[0] * percent_to_send)
+
+            u_sel = u[:num_to_send].contiguous()
+            s_sel = s[:num_to_send].contiguous()
+            vh_sel = vh[:, :num_to_send].contiguous()
+
+            if self.rank != root:
+                u_sel.zero_()
+                s_sel.zero_()
+                vh_sel.zero_()
+
+            wait_u = dist.broadcast(u_sel, src=root, async_op=True)
+            wait_s = dist.broadcast(s_sel, src=root, async_op=True)
+            wait_vh = dist.broadcast(vh_sel, src=root, async_op=True)
+            # TODO: seperate loop to let comms have time????
+            wait_u.wait()
+            wait_s.wait()
+            wait_vh.wait()
+
+            if self.rank != root:
+                u[-num_to_send:] = u_sel
+                s[-num_to_send:] = s_sel
+                vh[:, -num_to_send:] = vh_sel
+
+            # undo 1d concatenating
+            base_2d_repr, one_d_params = basis.get_1ds_from_2dcombi(
+                u @ s.diag() @ vh,
+                cat_dims=self.cat1d_dims[n],
+            )
+            # set 1D params
+            for n1d in one_d_params:
+                param = utils.rgetattr(self.model, n1d)
+                param.zero_()
+                param.add_(one_d_params[n1d])
+                # utils.reset_adam_state(self.optimizer, param)
+            # set ND param
+            if trans:
+                base_2d_repr = base_2d_repr.T
+            base_2d_repr = base_2d_repr.view(shp)
+            base_weight.zero_()
+            base_weight.add_(base_2d_repr)
+            # utils.reset_adam_state(self.optimizer, base_2d_repr)
+
+    @torch.no_grad()
+    def _one_to_all_sync_no_cat1d(self, root: int, percent_to_send: float):
+        # trade the percent to send with the partner from all ranks
+
+        # trading is on dim0 for U and V (making it dim1 for Vh)
+
+        # steps:
+        #   1. get 2d reps (if 1d, go through that)
+        #   2. get amount to send + send nonblocking, U will take longest, but with all the SVDs, it probably doesnt matter
+        #   3. recv from partner, create new USVh
+        #   4. set new USVh to model
+        if percent_to_send > 1:
+            raise ValueError(f"Percent to send must be < 1 -> {percent_to_send}")
+
+        # TODO: check memory hit, might be very high if keeping all the USVh mats
+        # my_usvh = {}
+        for n, base_weight in self.model.named_parameters():
+            if base_weight.ndim < 2:
+                continue
+            base_2d_repr, trans, shp = basis.get_2d_repr(base_weight)
+            u, s, vh = torch.linalg.svd(base_2d_repr, full_matrices=False)
+            # need buffer for u, s, and vh comms
+            num_to_send = int(s.shape[0] * percent_to_send)
+            num_to_send = int(s.shape[0] * percent_to_send)
+
+            u_sel = u[:num_to_send].contiguous()
+            s_sel = s[:num_to_send].contiguous()
+            vh_sel = vh[:, :num_to_send].contiguous()
+
+            if self.rank != root:
+                u_sel.zero_()
+                s_sel.zero_()
+                vh_sel.zero_()
+
+            wait_u = dist.broadcast(u_sel, src=root, async_op=True)
+            wait_s = dist.broadcast(s_sel, src=root, async_op=True)
+            wait_vh = dist.broadcast(vh_sel, src=root, async_op=True)
+            # TODO: seperate loop to let comms have time????
+            wait_u.wait()
+            wait_s.wait()
+            wait_vh.wait()
+
+            if self.rank != root:
+                u[-num_to_send:] = u_sel
+                s[-num_to_send:] = s_sel
+                vh[:, -num_to_send:] = vh_sel
+            # undo 1d concatenating
+            base_2d_repr = u @ s.diag() @ vh
+            # set ND param
+            if trans:
+                base_2d_repr = base_2d_repr.T
+            base_2d_repr = base_2d_repr.view(shp)
+            base_weight.zero_()
+            base_weight.add_(base_2d_repr)
+            # utils.reset_adam_state(self.optimizer, base_weight)
+
+    @torch.no_grad()
+    def _one_to_all_sync(self, root: int, percent_to_send: float):
+        waits = []
+        for n in self.names_to_average:
+            p = utils.rgetattr(self.model, n)
+            p /= self.world_size
+            waits.append(dist.all_reduce(p, async_op=True))
+
+        if self.cat1d:
+            self._one_to_all_sync_cat1d(root=root, percent_to_send=percent_to_send)
+        else:
+            self._one_to_all_sync_no_cat1d(root=root, percent_to_send=percent_to_send)
 
         for w in waits:
             w.wait()
@@ -414,57 +595,8 @@ class PatchworkSVDTrainer(BasicTrainer):
             if self.rank == self.logging_rank:
                 log.info("Sycning ranks - details in config")
 
-            basis.compare_bases_across_ranks(self.model)
-
-            waits = {}
-            svd_stuff = {}
-            for n, p in self.model.named_parameters():
-                if n not in self.names_not_sync_in_indiv or p.ndim == 1:
-                    # print(f"full sync: {n}")
-                    p.data /= dist.get_world_size()  # use full world size
-                    waits[n] = [dist.all_reduce(p.data, async_op=True), False, p.data]
-                    continue
-                else:
-                    # print(f"sigma sync: {n}")
-                    two_d_repr, trans, shp = basis.get_2d_repr(p)
-                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
-                    # s.data /= dist.get_world_size()  # use full world size
-                    svd_stuff[n] = (u, s, vh, trans, shp)
-                    # waits[n] = [dist.all_reduce(s.data, async_op=True), True, p.data]
-                    waits[n] = [None, True, p.data]
-            for n in waits:
-                w, t, p = waits[n]
-                if w is not None:
-                    w.wait()
-                if t:
-                    u, s, vh, trans, shp = svd_stuff[n]
-
-                    # cut out 1/world_size of the singular values
-                    if self.world_size > 1:
-                        cutoff = int(s.shape[0] * 0.75)  # / self.world_size)
-                        u[-cutoff:] *= 0
-                        s[-cutoff:] *= 0
-                        vh[:, -cutoff:] *= 0
-                        # if self.rank == self.logging_rank:
-                        #     print(cutoff, s.shape[0])
-                    hld = u @ s.diag() @ vh
-                    if trans:
-                        hld = hld.T
-                    hld = hld.view(shp)
-                    p.zero_()
-                    p.add_(hld)
-
-                    if self.rank == self.logging_rank:
-                        nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
-                        nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
-                        nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
-
-                        print(
-                            f"{n}: {s.mean():.4f}, {s.min():.4f}, {s.max():.4f} "
-                            f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
-                            f"<50% of first: {nz50perc:.4f}",
-                        )
-                utils.reset_adam_state(self.optimizer, p)
+            # basis.compare_bases_across_ranks(self.model)
+            self._parchwork_sync()
             self.model_to_run = self.model
         elif (
             self.total_train_iterations % (self.steps_btw_syncing // 3) == 0
@@ -473,7 +605,7 @@ class PatchworkSVDTrainer(BasicTrainer):
             # finish average here -> receive everything - wait? then we dont need to do the weighted average...
             # for now, can just have this be blocking
             if self.rank == self.logging_rank:
-                log.info(f"Compare sigma distribution: {self.current_iter}")
+                log.info(f"Compare sigma distribution: {self.total_train_iterations}")
 
             # basis.compare_bases_across_ranks(self.model)
 
@@ -482,8 +614,8 @@ class PatchworkSVDTrainer(BasicTrainer):
                     continue
                 else:
                     # print(f"sigma sync: {n}")
-                    two_d_repr, trans, shp = basis.get_2d_repr(p)
-                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
+                    two_d_repr, _, _ = basis.get_2d_repr(p)
+                    s = torch.linalg.svdvals(two_d_repr)
 
                     if self.rank == self.logging_rank:
                         nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
@@ -495,7 +627,7 @@ class PatchworkSVDTrainer(BasicTrainer):
                             f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
                             f"<50% of first: {nz50perc:.4f}",
                         )
-                utils.reset_adam_state(self.optimizer, p)
+                # utils.reset_adam_state(self.optimizer, p)
             self.model_to_run = self.model
 
     def _log_train(self, loss):

@@ -4,7 +4,7 @@ iterations_per_train: 100
 
 # number of validation steps to execute at the beginning of the training
 # num_sanity_val_steps: 0
-trainer: "lr_dist_train"
+trainer: "patchwork_trainer"
 
 # ckpt path
 checkpoint: null # /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models/baseine/vit_b_16-imagenet/epoch43.pth.tar #
@@ -63,8 +63,11 @@ print_freq: 50
 
 init_method: unified  # options: random, unified, random-sigma, ortho-sigma
 
-syncing:
+patchwork_svd:
   warmup_steps: 10
-  sync_freq: 10
   steps_btw_syncing: 10
   names_to_always_sync: null
+  comm_method: all-to-all
+  comm_kwargs:
+    percent_to_send: 0.25
+  cat1d: True

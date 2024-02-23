@@ -5,7 +5,7 @@ defaults:
   - data: cifar10.yaml # imagenet.yaml #
   - model: resnet.yaml # vit.yaml # resnet-rs.yaml # cirsean4.yaml # conv_dense.yaml #
   - tracking: wandb.yaml  # mlflow.yaml # set tracking here or use command line (e.g. `python train.py tracking=tensorboard`)
-  - training: lr_dist_trainer_conf.yaml
+  - training: patchwork_trainer_conf.yaml
   - log_dir: default.yaml
   # experiment configs allow for version control of specific configurations
   # e.g. hyperparameters for each combination of model and data
@@ -39,7 +39,7 @@ validate: True
 test: False
 seed: null
 # default name for the experiment for logging
-name: "lr-sync"
+name: "patchwork"
 baseline: False
 
 comm_method: "nccl"

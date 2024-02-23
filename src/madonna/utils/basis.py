@@ -115,15 +115,16 @@ def compare_bases_baseline(model1: nn.Module, model2: nn.Module, baseline: bool 
 
 
 def get_2d_repr(weight: torch.Tensor) -> list[torch.Tensor, bool, torch.Size]:
+    shp = weight.shape
     dims = weight.squeeze().ndim
     if dims < 2:
         return None, False, weight.shape
     if dims == 2:
+        weight = weight.squeeze()
         trans = weight.shape[0] < weight.shape[1]
-        return weight.T if trans else weight, trans, weight.shape
+        return weight.T if trans else weight, trans, shp
 
     # if p.ndim > 2:  # collapse down to 2D
-    shp = weight.shape
     hld = weight.view(weight.shape[0], -1)
     trans = hld.shape[0] < hld.shape[1]
     return hld.T if trans else hld, trans, shp
@@ -159,10 +160,10 @@ def get_2d_rep_w_1d_names(
     for app_name in names1d[base_name]:
         lp_weight = rgetattr(model, app_name)
         # Find matching dimension in base_2d
-        same_dim = torch.nonzero(base_2d.shape == lp_weight.shape).flatten()[0].item()
+        same_dim = torch.nonzero(torch.tensor(base_2d.shape) == torch.tensor(lp_weight.shape)).flatten()[0].item()
         other_dim = (same_dim + 1) % 2  # Calculate the other dimension for concatenation
-        base_2d = torch.cat([base_2d, lp_weight.unsqueeze(other_dim)], dim=same_dim)
-        cat_dims[app_name] = same_dim
+        base_2d = torch.cat([base_2d, lp_weight.unsqueeze(other_dim)], dim=other_dim)
+        cat_dims[app_name] = other_dim
     return base_2d, cat_dims
 
 
@@ -218,12 +219,15 @@ def get_1d_associated_weights(model: torch.Tensor, names_to_ignore: list = None)
             ignored_names.append(n)
             continue
         dims = p.squeeze().ndim
-        if dims > 1 and last_miltidim_w is not None:
+        if dims > 1:
             last_miltidim_w = n
             join_dict[n] = []
         elif last_miltidim_w is not None and dims == 1:
             join_dict[last_miltidim_w].append(n)
-        else:  # names which are not touched by the rest are here
+        elif dims == 1:  # names which are not touched by the rest are here
+            # print(n, p.shape, dims)
             ignored_names.append(n)
+
+    # print("1d weights ignored:", ignored_names)
 
     return join_dict, ignored_names

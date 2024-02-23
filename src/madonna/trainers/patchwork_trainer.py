@@ -41,6 +41,7 @@ import madonna
 import wandb
 
 from .lr_dist_trainer import LowRankSyncTrainer
+from .patchwork import PatchworkSVDTrainer
 
 best_acc1 = 0
 log = logging.getLogger(__name__)
@@ -179,7 +180,7 @@ def main(config):  # noqa: C901
 
     train_metrics = WrappedMetrics(epoch=0, len_loader=config.training.iterations_per_train)
 
-    trainer = LowRankSyncTrainer(
+    trainer = PatchworkSVDTrainer(
         model=model,
         optimizer=optimizer,
         criterion=criterion,
