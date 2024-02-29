@@ -2,8 +2,8 @@
 
 training:
   start_epoch: 0
-  epochs: 300
-  iterations_per_train: 50
+  epochs: 100
+  iterations_per_train: 300
 
   # number of validation steps to execute at the beginning of the training
   # num_sanity_val_steps: 0
@@ -16,35 +16,53 @@ training:
   lr: 0.001
   lr_schedule:
     sched: cosine  # cosine LR scheduler from timm
-    epochs: 300  # number of epochs for the cycle to run for
-    warmup_epochs: 10
-    min_lr: 0.00001  # min LR of cosine annealing pattern
+    epochs: 100  # number of epochs for the cycle to run for
+    warmup_epochs: 1
+    min_lr: 0.01  # min LR of cosine annealing pattern
     warmup_lr: 0.00001  # starting point of warmup
-
-  init_method: rand-sigma  # options: random, unified, rand-sigma, ortho-sigma
+    # warmup_prefix: False  # default
+    # lr_cycle_mul: 1.0  # default -> cycle length: int(math.floor(-self.t_initial * (self.cycle_mul ** cycles - 1) / (1 - self.cycle_mul)))
+    # lr_cycle_limit: 30
+    # lr_cycle_decay: 0.4  # NOTE: the implementation is wrong in the docs!! it should be that the decay_rate is lr_cycle_decay!!!
+    # lr_k_decay: 1.0  # default 1.0
+    # sched_on_updates: True
+  sync_batchnorm: True
+  init_method: ortho-sigma  # options: random, unified, rand-sigma, ortho-sigma
   patchwork_svd:
     warmup_steps: 0
-    steps_btw_syncing: 1000
-    names_to_always_sync: null
-      # - fc.weight
-      # - fc.bias
-      # - conv1.weight
+    steps_btw_syncing: 2400
+    ddp_steps_after_sync: 1000
+    zero_small_sig_vals: False
+    names_to_always_sync: # null
+      - fc.weight
+      - fc.bias
+      - conv1.weight
       # - cls_token
       # - pos_embed
       # - head.weight
-    comm_method: one-to-all
+    comm_method: all-to-all
     comm_kwargs:
       percent_to_send: 0.25
     cat1d: False
+    reset_opt: True
+  # optimizer:
+  #   _partial_: True
+  #   _target_: torch.optim.SGD
+  #   weight_decay: 0.00001
+  #   momentum: 0.9
 
 
 data:
-  timm_transforms: True
-  local_batch_size: 1024
+  timm_transforms: False
+  local_batch_size: 256
+  distributed_sample_val: True
+
+model:
+  autocast: True
 
 tracking:
   logging_rank: 0
 
-name: pw-one-all-rand-sigma-1024
-enable_tracking: False
+name: testing
+enable_tracking: True
 baseline: True

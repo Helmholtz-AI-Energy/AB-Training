@@ -59,7 +59,7 @@ p_optimizer: null
 federated: False
 
 init_opt_with_model: False
-print_freq: 50
+print_freq: 25
 
 init_method: unified  # options: random, unified, random-sigma, ortho-sigma
 
@@ -71,3 +71,4 @@ patchwork_svd:
   comm_kwargs:
     percent_to_send: 0.25
   cat1d: True
+  reset_opt: False

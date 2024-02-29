@@ -5,12 +5,13 @@ from copy import deepcopy
 import scipy
 import torch
 import torch.distributed as dist
+import torch.nn.utils.prune as prune
 from torch.nn.modules import Module
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torchmetrics import MetricCollection
 
-from ..utils import basis, mixing, utils
+from ..utils import basis, mixing, rgetattr, utils
 from .base_trainer import BasicTrainer
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ class PatchworkSVDTrainer(BasicTrainer):
         """
         self.warmup_steps = config.training.patchwork_svd.warmup_steps
         self.steps_btw_syncing = config.training.patchwork_svd.steps_btw_syncing
+        self.ddp_steps_after_sync = config.training.patchwork_svd.ddp_steps_after_sync
+        self.zero_small_sig_vals = config.training.patchwork_svd.zero_small_sig_vals
 
         if config.training.patchwork_svd.names_to_always_sync is None:
             names_to_always_sync = []
@@ -57,18 +60,20 @@ class PatchworkSVDTrainer(BasicTrainer):
         self.names_to_always_sync = names_to_always_sync
         self.all_names = []
         # names to not sync during individual training
-        self.names_not_sync_in_indiv = []
+        self.ddp_params_and_buffers_to_ignore = []
         if names_to_always_sync is not None:
             for n, _ in model.named_parameters():
                 self.all_names.append(n)
                 if n not in names_to_always_sync or len(names_to_always_sync) == 0:
                     # have to build inverse of list
-                    self.names_not_sync_in_indiv.append(n)
+                    self.ddp_params_and_buffers_to_ignore.append(n)
 
         self.comm_method = config.training.patchwork_svd.comm_method
         if self.comm_method in ["partner", "one-to-all"]:
             self.comm_percent_to_send = config.training.patchwork_svd.comm_kwargs.percent_to_send
             self.comm_generator = torch.Generator().manual_seed(123456)  # no device -> use cpu
+        else:
+            self.comm_percent_to_send = 1 / self.world_size
 
         self.local_model = self.model
 
@@ -82,15 +87,29 @@ class PatchworkSVDTrainer(BasicTrainer):
             self.cat1d_dims = {}
         else:
             self.names_to_average = []
+            self.names_to_not_average = []
             for n, p in self.model.named_parameters():
                 if p.squeeze().ndim < 2:
                     self.names_to_average.append(n)
+                # else:
+                #     self.names_to_not_average.append(n)
+
+        self.comm_reset_opt_on_sync = config.training.patchwork_svd.reset_opt
 
         # start in warmup mode (standard global DDP)
-        self.no_ddp = False
-        if self.warmup_steps > 0 and len(self.names_to_always_sync) != 0:
+        self.sync_bn = config.training.sync_batchnorm
+        self.no_ddp = True
+        if self.warmup_steps > 0:
             ddp_model = DDP(self.model)
-            self.no_ddp = True
+            if self.sync_bn:
+                ddp_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ddp_model).to(device)
+            self.no_ddp = False
+        elif len(self.names_to_always_sync) != 0:
+            self.model._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
+            ddp_model = DDP(self.model)
+            if self.sync_bn:
+                ddp_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ddp_model).to(device)
+            self.no_ddp = False
 
         if config.training.init_method == "rand-sigma":
             rank = dist.get_rank()
@@ -98,23 +117,48 @@ class PatchworkSVDTrainer(BasicTrainer):
             self.local_gen = torch.Generator(device=device).manual_seed(local_seed)
             with torch.no_grad():
                 for n, p in self.model.named_parameters():
-                    if n in self.names_to_always_sync:
+                    if n not in self.ddp_params_and_buffers_to_ignore:  # in self.names_to_always_sync:
                         continue
                     two_d_repr, trans, shp = basis.get_2d_repr(p)
-                    if two_d_repr is not None:
-                        u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
-                        order = torch.randperm(s.shape[0], generator=self.local_gen, device=s.device)
-                        rand = torch.rand_like(s)
-                        new_s = s[order] * rand
+                    if two_d_repr is None:
+                        continue
+                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
+                    order = torch.randperm(s.shape[0], generator=self.local_gen, device=s.device)
+                    rand = torch.rand_like(s)
+                    new_s = s[order] * rand
 
-                        hld = u @ new_s.diag() @ vh
-                        if trans:
-                            hld = hld.T
-                        hld = hld.view(shp)
-                        p.zero_()
-                        p.add_(hld)
+                    hld = u @ new_s.diag() @ vh
+                    if trans:
+                        hld = hld.T
+                    hld = hld.view(shp)
+                    p.zero_()
+                    p.add_(hld)
+        elif config.training.init_method == "sloped-sigma":
+            rank = dist.get_rank()
+            local_seed = torch.random.initial_seed() + rank
+            # self.local_gen = torch.Generator(device=device).manual_seed(local_seed)
+            with torch.no_grad():
+                for n, p in self.model.named_parameters():
+                    if n not in self.ddp_params_and_buffers_to_ignore:  # in self.names_to_always_sync:
+                        continue
+                    two_d_repr, trans, shp = basis.get_2d_repr(p)
+                    if two_d_repr is None:
+                        continue
+                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
+                    decay_factor = torch.tensor(0.1)
+                    exponents = torch.arange(s.shape[0], dtype=s.dtype, device=s.device)
+                    new_s = s[0] * 2 * decay_factor**exponents
+                    # rand = torch.rand_like(s)
+                    # new_s = s[order] * rand
 
-        if self.warmup_steps > 0 and len(self.names_to_always_sync) != 0:
+                    hld = u @ new_s.diag() @ vh
+                    if trans:
+                        hld = hld.T
+                    hld = hld.view(shp)
+                    p.zero_()
+                    p.add_(hld)
+
+        if self.warmup_steps > 0 or len(self.names_to_always_sync) != 0:
             self.model_to_run = ddp_model  # ddp on all ranks
 
     @torch.no_grad()
@@ -172,10 +216,9 @@ class PatchworkSVDTrainer(BasicTrainer):
             self.cat1d_dims[n] = cat_names_n
             u, s, vh = torch.linalg.svd(catted, full_matrices=False)
             # need buffer for u, s, and vh comms
-            num_to_send = int(s.shape[0] * percent_to_send)
-            send_u = u[:num_to_send].contiguous()
-            send_s = s[:num_to_send].contiguous()
-            send_vh = vh[:, :num_to_send].contiguous()
+            send_u = u[: int(u.shape[0] * percent_to_send)].contiguous()
+            send_s = s[: int(s.shape[0] * percent_to_send)].contiguous()
+            send_vh = vh[:, : int(vh.shape[0] * percent_to_send)].contiguous()
 
             recv_u, recv_s, recv_vh = torch.zeros_like(send_u), torch.zeros_like(send_s), torch.zeros_like(send_vh)
 
@@ -197,13 +240,13 @@ class PatchworkSVDTrainer(BasicTrainer):
             # u
             # waits[0].wait()
             # waits[1].wait()
-            u[-num_to_send:] = recv_u
+            u[-int(u.shape[0] * percent_to_send) :] = recv_u
             # waits[2].wait()
             # waits[3].wait()
-            s[-num_to_send:] = recv_s
+            s[-int(s.shape[0] * percent_to_send) :] = recv_s
             # waits[4].wait()
             # waits[5].wait()
-            vh[:, -num_to_send:] = recv_vh
+            vh[:, -int(vh.shape[0] * percent_to_send) :] = recv_vh
             # undo 1d concatenating
             base_2d_repr, one_d_params = basis.get_1ds_from_2dcombi(
                 u @ s.diag() @ vh,
@@ -214,14 +257,16 @@ class PatchworkSVDTrainer(BasicTrainer):
                 param = utils.rgetattr(self.model, n1d)
                 param.zero_()
                 param.add_(one_d_params[n1d])
-                # utils.reset_adam_state(self.optimizer, param)
+                if self.comm_reset_opt_on_sync:
+                    utils.reset_adam_state(self.optimizer, param)
             # set ND param
             if trans:
                 base_2d_repr = base_2d_repr.T
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
-            # utils.reset_adam_state(self.optimizer, base_2d_repr)
+            if self.comm_reset_opt_on_sync:
+                utils.reset_adam_state(self.optimizer, base_2d_repr)
 
     @torch.no_grad()
     def _partner_sync_no_cat1d(self, partner: int, percent_to_send: float):
@@ -291,7 +336,8 @@ class PatchworkSVDTrainer(BasicTrainer):
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
-            # utils.reset_adam_state(self.optimizer, base_weight)
+            if self.comm_reset_opt_on_sync:
+                utils.reset_adam_state(self.optimizer, base_weight)
 
     @torch.no_grad()
     def _partner_sync(self, partner: int, percent_to_send: float):
@@ -329,18 +375,24 @@ class PatchworkSVDTrainer(BasicTrainer):
             u, s, vh = torch.linalg.svd(catted, full_matrices=False)
             # this one will use USVh in place and will just move things around
             # leftover = s.shape[0] % self.world_size -> handled automatically by zeroing
-            keeping = s.shape[0] // self.world_size
-            start = keeping * self.rank
-            stop = keeping * (self.rank + 1)
-            u_sel = u[:keeping].clone()
-            s_sel = s[:keeping].clone()
-            vh_sel = vh[:, :keeping].clone()
+            keep_u = u.shape[0] // self.world_size
+            st_u, sp_u = keep_u * self.rank, keep_u * (self.rank + 1)
+            keep_s = s.shape[0] // self.world_size
+            st_s, sp_s = keep_s * self.rank, keep_s * (self.rank + 1)
+            keep_vh = vh.shape[1] // self.world_size
+            st_vh, sp_vh = keep_vh * self.rank, keep_vh * (self.rank + 1)
+            u_sel = u[:keep_u].clone()
+            s_sel = s[:keep_s].clone()
+            vh_sel = vh[:, :keep_vh].clone()
             u.zero_()
             s.zero_()
             vh.zero_()
-            u[start:stop] += u_sel
-            s[start:stop] += s_sel
-            vh[:, start:stop] += vh_sel
+            u[st_u:sp_u] += u_sel
+            s[st_s:sp_s] += s_sel
+            vh[:, st_vh:sp_vh] += vh_sel
+            # if self.rank == 0:
+            #     print(f"{n} u: {u.shape} {keep_u}, s: {s.shape} {keep_s}, vh: {vh.shape} {keep_vh}")
+
             u = u.contiguous()
             s = s.contiguous()
             vh = vh.contiguous()
@@ -362,14 +414,16 @@ class PatchworkSVDTrainer(BasicTrainer):
                 param = utils.rgetattr(self.model, n1d)
                 param.zero_()
                 param.add_(one_d_params[n1d])
-                # utils.reset_adam_state(self.optimizer, param)
+                if self.comm_reset_opt_on_sync:
+                    utils.reset_adam_state(self.optimizer, param)
             # set ND param
             if trans:
                 base_2d_repr = base_2d_repr.T
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
-            # utils.reset_adam_state(self.optimizer, base_2d_repr)
+            if self.comm_reset_opt_on_sync:
+                utils.reset_adam_state(self.optimizer, base_2d_repr)
 
     @torch.no_grad()
     def _all_to_all_sync_no_cat1d(self):
@@ -382,18 +436,21 @@ class PatchworkSVDTrainer(BasicTrainer):
             base_2d_repr, trans, shp = basis.get_2d_repr(base_weight)
             u, s, vh = torch.linalg.svd(base_2d_repr, full_matrices=False)
             # this one will use USVh in place and will just move things around
-            keeping = s.shape[0] // self.world_size
-            start = keeping * self.rank
-            stop = keeping * (self.rank + 1)
-            u_sel = u[:keeping].clone()
-            s_sel = s[:keeping].clone()
-            vh_sel = vh[:, :keeping].clone()
+            keep_u = u.shape[0] // self.world_size
+            st_u, sp_u = keep_u * self.rank, keep_u * (self.rank + 1)
+            keep_s = s.shape[0] // self.world_size
+            st_s, sp_s = keep_s * self.rank, keep_s * (self.rank + 1)
+            keep_vh = vh.shape[1] // self.world_size
+            st_vh, sp_vh = keep_vh * self.rank, keep_vh * (self.rank + 1)
+            u_sel = u[:keep_u].clone()
+            s_sel = s[:keep_s].clone()
+            vh_sel = vh[:, :keep_vh].clone()
             u.zero_()
             s.zero_()
             vh.zero_()
-            u[start:stop] += u_sel
-            s[start:stop] += s_sel
-            vh[:, start:stop] += vh_sel
+            u[st_u:sp_u] += u_sel
+            s[st_s:sp_s] += s_sel
+            vh[:, st_vh:sp_vh] += vh_sel
 
             u = u.contiguous()
             s = s.contiguous()
@@ -414,7 +471,8 @@ class PatchworkSVDTrainer(BasicTrainer):
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
-            # utils.reset_adam_state(self.optimizer, base_weight)
+            if self.comm_reset_opt_on_sync:
+                utils.reset_adam_state(self.optimizer, base_weight)
 
     @torch.no_grad()
     def _all_to_all_sync(self):
@@ -459,11 +517,9 @@ class PatchworkSVDTrainer(BasicTrainer):
             self.cat1d_dims[n] = cat_names_n
             u, s, vh = torch.linalg.svd(catted, full_matrices=False)
             # need buffer for u, s, and vh comms
-            num_to_send = int(s.shape[0] * percent_to_send)
-
-            u_sel = u[:num_to_send].contiguous()
-            s_sel = s[:num_to_send].contiguous()
-            vh_sel = vh[:, :num_to_send].contiguous()
+            u_sel = u[: int(u.shape[0] * percent_to_send)].contiguous()
+            s_sel = s[: int(s.shape[0] * percent_to_send)].contiguous()
+            vh_sel = vh[:, : int(vh.shape[1] * percent_to_send)].contiguous()
 
             if self.rank != root:
                 u_sel.zero_()
@@ -479,9 +535,9 @@ class PatchworkSVDTrainer(BasicTrainer):
             wait_vh.wait()
 
             if self.rank != root:
-                u[-num_to_send:] = u_sel
-                s[-num_to_send:] = s_sel
-                vh[:, -num_to_send:] = vh_sel
+                u[-int(u.shape[0] * percent_to_send) :] = u_sel
+                s[-int(s.shape[0] * percent_to_send) :] = s_sel
+                # vh[:, -int(vh.shape[0] * percent_to_send):] = vh_sel
 
             # undo 1d concatenating
             base_2d_repr, one_d_params = basis.get_1ds_from_2dcombi(
@@ -493,14 +549,16 @@ class PatchworkSVDTrainer(BasicTrainer):
                 param = utils.rgetattr(self.model, n1d)
                 param.zero_()
                 param.add_(one_d_params[n1d])
-                # utils.reset_adam_state(self.optimizer, param)
+                if self.comm_reset_opt_on_sync:
+                    utils.reset_adam_state(self.optimizer, param)
             # set ND param
             if trans:
                 base_2d_repr = base_2d_repr.T
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
-            # utils.reset_adam_state(self.optimizer, base_2d_repr)
+            if self.comm_reset_opt_on_sync:
+                utils.reset_adam_state(self.optimizer, base_2d_repr)
 
     @torch.no_grad()
     def _one_to_all_sync_no_cat1d(self, root: int, percent_to_send: float):
@@ -524,12 +582,10 @@ class PatchworkSVDTrainer(BasicTrainer):
             base_2d_repr, trans, shp = basis.get_2d_repr(base_weight)
             u, s, vh = torch.linalg.svd(base_2d_repr, full_matrices=False)
             # need buffer for u, s, and vh comms
-            num_to_send = int(s.shape[0] * percent_to_send)
-            num_to_send = int(s.shape[0] * percent_to_send)
 
-            u_sel = u[:num_to_send].contiguous()
-            s_sel = s[:num_to_send].contiguous()
-            vh_sel = vh[:, :num_to_send].contiguous()
+            u_sel = u[: int(u.shape[0] * percent_to_send)].contiguous()
+            s_sel = s[: int(s.shape[0] * percent_to_send)].contiguous()
+            vh_sel = vh[:, : int(vh.shape[1] * percent_to_send)].contiguous()
 
             if self.rank != root:
                 u_sel.zero_()
@@ -545,9 +601,9 @@ class PatchworkSVDTrainer(BasicTrainer):
             wait_vh.wait()
 
             if self.rank != root:
-                u[-num_to_send:] = u_sel
-                s[-num_to_send:] = s_sel
-                vh[:, -num_to_send:] = vh_sel
+                u[-int(u.shape[0] * percent_to_send) :] = u_sel
+                s[-int(s.shape[0] * percent_to_send) :] = s_sel
+                vh[:, -int(vh.shape[0] * percent_to_send) :] = vh_sel
             # undo 1d concatenating
             base_2d_repr = u @ s.diag() @ vh
             # set ND param
@@ -556,7 +612,8 @@ class PatchworkSVDTrainer(BasicTrainer):
             base_2d_repr = base_2d_repr.view(shp)
             base_weight.zero_()
             base_weight.add_(base_2d_repr)
-            # utils.reset_adam_state(self.optimizer, base_weight)
+            if self.comm_reset_opt_on_sync:
+                utils.reset_adam_state(self.optimizer, base_weight)
 
     @torch.no_grad()
     def _one_to_all_sync(self, root: int, percent_to_send: float):
@@ -575,49 +632,140 @@ class PatchworkSVDTrainer(BasicTrainer):
             w.wait()
 
     @torch.no_grad()
-    def _pre_forward(self):
+    def _post_train_step(self):
+        # def _pre_forward(self):
         # select model for forward step
         # if self.total_train_iterations < self.warmup_steps:
         #     self.model_to_run = self.models['global']
         # print(self.total_train_iterations, self.warmup_steps)
         if self.total_train_iterations == self.warmup_steps and not self.no_ddp:
+            if self.rank == self.logging_rank:
+                log.info(
+                    f"End of Warmup: {self.total_train_iterations} current epoch: {self.current_iter}/{self.iterations_per_train}",
+                )
             # if warmup is done, transition to individual mode
-            self.model._ddp_params_and_buffers_to_ignore = self.names_not_sync_in_indiv
-            # print(self.model._ddp_params_and_buffers_to_ignore)
-            self.model_to_run = DDP(self.model) if len(self.names_to_always_sync) > 0 else self.model
-            # print(self.model_to_run)
+            self.model._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
+            # self.model_to_run = DDP(self.model) if len(self.names_to_always_sync) > 0 else self.model
+            # self.model._ddp_params_and_buffers_to_ignore = self.names_to_not_average
+            self.model_to_run = DDP(self.model)
+            if self.sync_bn:
+                self.model_to_run = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model_to_run).to(self.device)
         elif (
             self.total_train_iterations % self.steps_btw_syncing == 0
             and self.total_train_iterations > self.warmup_steps
         ):
-            # finish average here -> receive everything - wait? then we dont need to do the weighted average...
-            # for now, can just have this be blocking
-            if self.rank == self.logging_rank:
-                log.info("Sycning ranks - details in config")
+            # # finish average here -> receive everything - wait? then we dont need to do the weighted average...
+            # # for now, can just have this be blocking
 
-            # basis.compare_bases_across_ranks(self.model)
-            self._parchwork_sync()
-            self.model_to_run = self.model
+            if self.rank == self.logging_rank:
+                log.info(
+                    f"Sycning ranks - iteration: {self.total_train_iterations} "
+                    f"current epoch: {self.current_iter}/{self.iterations_per_train}",
+                )
+
+            # # # basis.compare_bases_across_ranks(self.model)
+            # self._parchwork_sync()
+
+            # -------- undo pruning and add models together -----------
+            # reset_model_pruning(self.model_to_run)
+
+            for n, p in list(self.model_to_run.named_parameters()):
+                # parts = n.split(".")
+                # module_n = ".".join(parts[:-1])
+                # if n not in self.ddp_params_and_buffers_to_ignore or p.ndim == 1:
+                # dist.all_reduce(p, op=dist.ReduceOp.AVG)
+                dist.all_reduce(p, op=dist.ReduceOp.AVG)
+                if p.ndim > 1 and self.zero_small_sig_vals:
+                    two_d_repr, trans, shp = basis.get_2d_repr(p)
+                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
+                    nz10 = torch.nonzero(s < s[0] * 0.1)
+                    if self.rank == self.logging_rank:
+                        # print(two_d_repr[:10, :10])
+                        nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
+                        nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
+                        nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
+
+                        # print(
+                        #     f"{n}: {s.mean():.4f}, {s.min():.4f}, {s.max():.4f} "
+                        #     f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
+                        #     f"<50% of first: {nz50perc:.4f}",
+                        # )
+                    if self.total_train_iterations >= self.steps_btw_syncing * 2:
+                        if self.rank == self.logging_rank:
+                            log.info(f"Removing {nz10perc * 100:.4f}% of sigma vals")
+                        u[:, nz10] *= 0
+                        s[nz10] *= 0
+                        vh[nz10] *= 0
+                        # vh[:, int(vh.shape[0] * self.comm_percent_to_send):] *= 0
+                        hld = u @ s.diag() @ vh
+                        if trans:
+                            hld = hld.T
+                        hld = hld.view(shp)
+                        p.zero_()
+                        p.add_(hld)
+
+                # pass
+                # else:
+                #     # if p.ndim == 1:
+                #     #     hld = p
+                #     #     trans = False
+                #     #     shp = p.shape
+                #     # else:
+                #     hld, trans, shp = basis.get_2d_repr(p)
+                #     hld = hld.contiguous()
+                #     dist.all_reduce(hld, op=dist.ReduceOp.SUM)  # defualt op is sum
+                #     if trans:
+                #         hld = hld.T
+                #     hld = hld.view(shp)
+                #     p.zero_()
+                #     p.add_(hld)
+                if self.comm_reset_opt_on_sync:
+                    utils.reset_adam_state(self.optimizer, p)
+
+            if isinstance(self.model_to_run, DDP):
+                self.model_to_run = self.model_to_run.module
+            self.model_to_run._ddp_params_and_buffers_to_ignore = []
+            self.model_to_run = DDP(self.model_to_run)
+            if self.sync_bn:
+                self.model_to_run = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model_to_run).to(self.device)
+
+            # self.model_to_run = self.model
         elif (
-            self.total_train_iterations % (self.steps_btw_syncing // 3) == 0
-            and self.total_train_iterations > self.warmup_steps
+            self.total_train_iterations > self.warmup_steps
+            and self.total_train_iterations % self.steps_btw_syncing == self.ddp_steps_after_sync
+            # self.total_train_iterations % (self.steps_btw_syncing // 2) == 0
+            # and self.total_train_iterations > self.warmup_steps
         ):
             # finish average here -> receive everything - wait? then we dont need to do the weighted average...
             # for now, can just have this be blocking
             if self.rank == self.logging_rank:
-                log.info(f"Compare sigma distribution: {self.total_train_iterations}")
+                log.info(
+                    f"Compare sigma distribution: {self.total_train_iterations} "
+                    f"current epoch: {self.current_iter}/{self.iterations_per_train}",
+                )
 
-            # basis.compare_bases_across_ranks(self.model)
+            basis.compare_bases_across_ranks(self.model_to_run)
 
-            for n, p in self.model.named_parameters():
-                if n not in self.names_not_sync_in_indiv or p.ndim == 1:
-                    continue
-                else:
-                    # print(f"sigma sync: {n}")
-                    two_d_repr, _, _ = basis.get_2d_repr(p)
-                    s = torch.linalg.svdvals(two_d_repr)
+            # pruning tests: --------------------------
+            # if self.rank == self.logging_rank:
+            #     log.info(f"Removing sigma vals")
 
+            if isinstance(self.model_to_run, DDP):
+                self.model_to_run = self.model_to_run.module
+            self.model_to_run._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
+            self.model_to_run = DDP(self.model_to_run)
+            if self.sync_bn:
+                self.model_to_run = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model_to_run).to(self.device)
+
+            for n, p in list(self.model_to_run.named_parameters()):
+                # parts = n.split(".")
+                # module_n = ".".join(parts[:-1])
+                if p.ndim > 1:
+                    two_d_repr, trans, shp = basis.get_2d_repr(p)
+                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
+                    # nz10 = torch.nonzero(s < s[0] * 0.1)
                     if self.rank == self.logging_rank:
+                        # print(two_d_repr[:10, :10])
                         nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
                         nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
                         nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
@@ -627,8 +775,105 @@ class PatchworkSVDTrainer(BasicTrainer):
                             f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
                             f"<50% of first: {nz50perc:.4f}",
                         )
-                # utils.reset_adam_state(self.optimizer, p)
-            self.model_to_run = self.model
+                    # if self.total_train_iterations > self.steps_btw_syncing * 2:
+                    #     if self.rank == self.logging_rank:
+                    #         log.info(f"Removing {nz10perc * 100:.4f}% of sigma vals")
+                    #     u[:, nz10] *= 0
+                    #     s[nz10] *= 0
+                    #     vh[nz10] *= 0
+                    #     # vh[:, int(vh.shape[0] * self.comm_percent_to_send):] *= 0
+                    #     hld = u @ s.diag() @ vh
+                    #     if trans:
+                    #         hld = hld.T
+                    #     hld = hld.view(shp)
+                    #     p.zero_()
+                    #     p.add_(hld)
+                # if n in self.ddp_params_and_buffers_to_ignore or p.ndim == 1:
+                #     pass  # pass not continue for opt param reset
+                # else:
+                #     # # if p.ndim == 1:
+                #     # #     two_d_repr = p
+                #     # #     trans = False
+                #     # #     shp = p.shape
+                #     # # else:
+                #     two_d_repr, trans, shp = basis.get_2d_repr(p)
+
+                #     # # print(f"{n} {start}, {stop}")
+                #     # # if self.rank == self.logging_rank:
+                #     # #     log.info(f"Removing weight rows: {n} {trans} {two_d_repr.shape}")
+                #     # prune_dim = 1 if trans else 0
+                #     # start = int((two_d_repr.shape[prune_dim] /self.world_size) * self.rank)
+                #     # stop = int((two_d_repr.shape[prune_dim] /self.world_size) * (self.rank + 1))
+                #     # prune_mask = get_prune_mask_from_2d_repr(
+                #     #     two_d_repr, trans=trans, shp=shp, start=start, stop=stop, dim=prune_dim,
+                #     # )
+                #     # prune.custom_from_mask(rgetattr(self.model_to_run, module_n), 'weight', mask=prune_mask)
+
+                #     # hld = two_d_repr
+                #     # # hld *= prune_mask
+                #     # if trans:
+                #     #     hld = hld.T
+                #     # hld = hld.view(shp)
+                #     # hld *= prune_mask.to(hld.dtype)
+
+                #     # # if self.rank == self.logging_rank:
+                #     # #     print(two_d_repr[:10, :10])
+                #     # # # p.zero_()
+
+                #     # if self.rank == self.logging_rank:
+                #     #     print(p[:10, :10])
+                #     # p.add_(hld)
+
+                #     u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
+                #     if self.rank == self.logging_rank:
+                #         # print(two_d_repr[:10, :10])
+                #         nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
+                #         nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
+                #         nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
+
+                #         print(
+                #             f"{n}: {s.mean():.4f}, {s.min():.4f}, {s.max():.4f} "
+                #             f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
+                #             f"<50% of first: {nz50perc:.4f}",
+                #         )
+                # -----------------------------------------
+
+                # if self.rank == self.logging_rank:
+                #     log.info(f"Removing sigma vals")
+                # for n, p in self.model.named_parameters():
+                #     parts = n.split('.')
+                #     module_n = '.'.join(parts[:-1])
+                #     if n not in self.ddp_params_and_buffers_to_ignore or p.ndim == 1:
+                #         continue
+                #     else:
+                #         two_d_repr, trans, shp = basis.get_2d_repr(p)
+
+                #         u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
+                #         if self.rank == self.logging_rank:
+                #             nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
+                #             nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
+                #             nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
+
+                #             print(
+                #                 f"{n}: {s.mean():.4f}, {s.min():.4f}, {s.max():.4f} "
+                #                 f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
+                #                 f"<50% of first: {nz50perc:.4f}",
+                #             )
+                # # u[int(u.shape[0] * self.comm_percent_to_send):] *= 0
+                # s[int(s.shape[0] * self.comm_percent_to_send):] *= 0
+                # # vh[:, int(vh.shape[0] * self.comm_percent_to_send):] *= 0
+                # hld = u @ s.diag() @ vh
+                # if trans:
+                #     hld = hld.T
+                # hld = hld.view(shp)
+                # p.zero_()
+                # p.add_(hld)
+
+                # s = torch.linalg.svdvals(two_d_repr)
+
+                if self.comm_reset_opt_on_sync:
+                    utils.reset_adam_state(self.optimizer, p)
+            # self.model_to_run = self.model
 
     def _log_train(self, loss):
         # todo: metrics...
@@ -637,4 +882,26 @@ class PatchworkSVDTrainer(BasicTrainer):
         try:
             self.metrics.display(self.current_iter - 1)
         except AttributeError:
+            pass
+
+
+def get_prune_mask_from_2d_repr(twodimrepr, trans, shp, start, stop, dim=0):
+    # TODO: check that '1' means 'keep' in prune
+    mask = torch.zeros_like(twodimrepr, dtype=torch.int)
+    sl = [slice(None)] * twodimrepr.ndim
+    sl[dim] = slice(start, stop)
+    mask[sl] = 1  # set section of 2d repr to 0 to prune it off
+    # percent = 0.25
+    # mask = (torch.rand_like(twodimrepr) > percent).to(torch.bool)
+    if trans and twodimrepr.ndim > 1:
+        mask = mask.T
+    return mask.reshape(shp)
+
+
+def reset_model_pruning(model):
+    for module in model.modules():
+        try:
+            prune.remove(module, "weight")
+        except ValueError:
+            # no pruning on this layer
             pass

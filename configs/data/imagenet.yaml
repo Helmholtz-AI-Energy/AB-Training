@@ -3,7 +3,7 @@ dataset: imagenet
 data_dir_horeka: "/hkfs/home/dataset/datasets/imagenet-2012/original/imagenet-raw/ILSVRC/Data/CLS-LOC/"
 # data_dir: "/pfs/work7/workspace/scratch/qv2382-madonna-ddp/qv2382-madonna-ddp/datasets/imagenet/ILSVRC/Data/CLS-LOC/"
 data_dir_uc2: "/pfs/work7/workspace/scratch/qv2382-madonna-ddp/qv2382-madonna-ddp/datasets/imagenet/ILSVRC/Data/CLS-LOC/"
-local_batch_size: 128
+local_batch_size: 256
 num_workers: 8
 pin_memory: True
 timm_transforms: True
@@ -11,7 +11,7 @@ persistent_workers: True
 distributed_sample: True
 prefetch_factor: 4
 distributed_sample_val: True
-train_crop_size: 160
+train_crop_size: 224
 val_crop_size: 224
 dali: False
 classes: 1000

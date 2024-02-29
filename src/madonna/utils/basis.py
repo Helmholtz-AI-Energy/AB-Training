@@ -56,14 +56,21 @@ def compare_bases_across_ranks(model: nn.Module, baseline: bool = True):
         buff[rank] = uvh
         dist.all_reduce(buff)
         if rank == 0:
-            log.info(f"Comparins {n}")
+            log.info(f"Comparisons {n}")
 
+        msgs = []
+        sims = []
         for i, j in itertools.combinations(range(ws), 2):
             sim = cossim(buff[i], buff[j])
-            if rank == 0:
-                top5 = [f"{tf:.4f}" for tf in sim[:5]]
-                if sim.mean() < 0.9:
-                    log.info(f"ranks: {i} {j} - Similarity - {sim.mean():.4f}, top 5: {top5}")
+            sims.append(sim.mean())
+            # if rank == 0:
+            top5 = [f"{tf:.4f}" for tf in sim[:5]]
+            msgs.append(f"ranks: {i} {j} - Similarity - {sim.mean():.4f}, top 5: {top5}")
+        # if rank == 0 and sum(sims) / len(sims) < 0.9:
+        #     for m in msgs:
+        #         log.info(m)
+        if rank == 0:
+            log.info(f"Average sim across procs: {sum(sims) / len(sims)}")
 
 
 @torch.no_grad()

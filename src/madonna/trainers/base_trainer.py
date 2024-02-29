@@ -37,7 +37,10 @@ class BasicTrainer(object):
         self.infloader = CycleDataLoader(train_loader)
         self.metrics = metrics
         self.lr_scheduler = lr_scheduler
-        self.total_train_iterations, self.current_iter = 0, 0
+        self.total_train_iterations, self.current_iter = (
+            0,
+            0,
+        )  # TODO: is having this set to 1 the cause of the issues???
         self.max_train_iters = max_train_iters
         if iterations_per_train is None:
             log.info(f"No iterations per train specified, using len(train_loader): {len(train_loader)}")
@@ -71,6 +74,9 @@ class BasicTrainer(object):
     def _log_train(self, loss):
         pass
 
+    def _post_train_step(self):
+        pass
+
     def _train_step(self, data: tuple[torch.Tensor, torch.Tensor]) -> float:
         self.optimizer.zero_grad(set_to_none=True)
         inputs, labels = data
@@ -86,8 +92,9 @@ class BasicTrainer(object):
             loss = self.criterion(outputs, labels)
 
         if torch.isnan(loss):
-            for n, p in self.model_to_run.named_parameters():
-                print(f"{n}: {p.mean():.4f}, {p.min():.4f}, {p.max():.4f}, {p.std():.4f}")
+            if self.rank == self.logging_rank:
+                for n, p in self.model_to_run.named_parameters():
+                    print(f"{n}: {p.mean():.4f}, {p.min():.4f}, {p.max():.4f}, {p.std():.4f}")
             raise ValueError("NaN loss in training")
 
         try:
@@ -128,11 +135,10 @@ class BasicTrainer(object):
     def train(self) -> None:
         self.model_to_run.train()  # Put model in training mode
 
-        self.current_iter = 1
+        self.current_iter = 0
         t00 = time.perf_counter()
         t0 = time.perf_counter()
         for data in self.infloader:
-            # print(self.current_iter)
             data_time = time.perf_counter() - t0
             loss = self._train_step(data)
             batch_time = time.perf_counter() - t0
@@ -147,11 +153,15 @@ class BasicTrainer(object):
             if self.current_iter % self.log_freq == 0:
                 self._log_train(loss)
 
+            self._post_train_step()
+            # if self.logging_rank == self.rank:
+            #     print(f"{self.current_iter}, {self.iterations_per_train}, {self.total_train_iterations}")
             if self.current_iter == self.iterations_per_train:
                 break
             t0 = time.perf_counter()
 
-        self._log_train(loss)
+        if self.current_iter % self.log_freq != 0:
+            self._log_train(loss)
         if self.metrics is not None:
             return self.metrics.compute(), time.perf_counter() - t00
         return None, time.perf_counter() - t00

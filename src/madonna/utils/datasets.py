@@ -634,23 +634,25 @@ def cifar10_val_dataset_n_loader(config, group_size=None, group_rank=None, num_g
         download=True,
     )
 
-    # if dist.is_initialized() and config.training.federated:
-    #     sampler = data_samplers.HardSplitDistributedSampler(
-    #         test_dataset,
-    #         number_rolls=config.training.federated_args.number_rolls,
-    #         seed=dist.get_rank(),
-    #     )
-    # elif dist.is_initialized() and dsconfig["distributed_sample_val"]:
-    #     sampler = datadist.DistributedSampler(test_dataset)
-    # elif dist.is_initialized() and group_size is not None and group_size > 1:
-    #     sampler = datadist.DistributedSampler(
-    #         test_dataset,
-    #         rank=group_rank,
-    #         num_replicas=group_size,
-    #         seed=dist.get_rank() // group_size,
-    #     )
-    # else:
-    sampler = None
+    if dist.is_initialized() and config.training.federated:
+        sampler = data_samplers.HardSplitDistributedSampler(
+            test_dataset,
+            number_rolls=config.training.federated_args.number_rolls,
+            seed=dist.get_rank(),
+        )
+    elif not dsconfig["distributed_sample_val"]:
+        sampler = None
+    elif dist.is_initialized() and dsconfig["distributed_sample_val"]:
+        sampler = datadist.DistributedSampler(test_dataset)
+    elif dist.is_initialized() and group_size is not None and group_size > 1:
+        sampler = datadist.DistributedSampler(
+            test_dataset,
+            rank=group_rank,
+            num_replicas=group_size,
+            seed=dist.get_rank() // group_size,
+        )
+    else:
+        sampler = None
 
     test_loader = torch.utils.data.DataLoader(
         test_dataset,

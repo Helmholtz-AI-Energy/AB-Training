@@ -5,5 +5,6 @@ from . import (
     ortho_fix_train,
     patchwork,
     patchwork_trainer,
+    pruning,
 )
 from .images.baseline import *

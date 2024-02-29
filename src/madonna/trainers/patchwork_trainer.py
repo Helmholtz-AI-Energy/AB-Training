@@ -120,7 +120,12 @@ def main(config):  # noqa: C901
 
     if config.training.init_method == "random":
         seed += config.rank
-    elif dist.is_initialized() and config.training.init_method in ["unified", "rand-sigma", "ortho-sigma"]:
+    elif dist.is_initialized() and config.training.init_method in [
+        "unified",
+        "rand-sigma",
+        "ortho-sigma",
+        "sloped-sigma",
+    ]:
         dist.broadcast(tseed, src=0)
     else:
         raise ValueError(
@@ -136,9 +141,9 @@ def main(config):  # noqa: C901
     torch.manual_seed(seed)
 
     log.info(f"Seed: {seed}, init method: {config.training.init_method}")
-    if config.training.init_method == "random-simga":
-        with open_dict(config):
-            config.training.seed = seed
+    # if config.training.init_method == "random-simga":
+    #     with open_dict(config):
+    #         config.training.seed = seed
     # =========================================== END Seed setting =======================================
 
     # print('before get model')
@@ -190,6 +195,8 @@ def main(config):  # noqa: C901
         config=config,
         metrics=train_metrics,
     )
+    if config.rank == 0:
+        print(f"len dataloader: {len(trainer.infloader)}")
 
     # optionally resume from a checkpoint
     # Reminder: when resuming from a single checkpoint, make sure to call init_model with
@@ -271,6 +278,8 @@ def main(config):  # noqa: C901
                     "train/time": train_time,
                 },
             )
+        if rank == config.tracking.logging_rank:
+            log.info(f"End Train params avg across procs: loss: {ls:.4f}\ttop1: {t1:.4f}\ttop5: {t5:.4f}")
         # evaluate on validation set
         val_top1, val_loss = validate(
             val_loader=val_loader,
@@ -443,12 +452,13 @@ def validate(val_loader, model, criterion, config, device, wandb_logger, metrics
 
                 # if (i % config.training.print_freq == 0 or i == num_elem) and print_on_rank:
                 if (i % 50 == 0 or i == num_elem) and config.tracking.logging_rank == config.rank:
+                    progress.display(i + 1, log=log)
+                if i % 50 == 0 or i == num_elem:
                     argmax = torch.argmax(output, dim=1).to(torch.float32)
                     print(
-                        f"output mean: {argmax.mean().item()}, max: {argmax.max().item()}, ",
-                        f"min: {argmax.min().item()}, std: {argmax.std().item()}",
+                        f"output mean: {argmax.mean():.4f}, max: {argmax.max():.4f}, ",
+                        f"min: {argmax.min():.4f}, std: {argmax.std():.4f}",
                     )
-                    progress.display(i + 1, log=log)
 
     batch_time = AverageMeter("Time", ":6.3f", Summary.NONE)
     data_time = AverageMeter("Data", ":6.3f", Summary.NONE)
