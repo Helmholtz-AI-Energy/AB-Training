@@ -33,10 +33,18 @@ if [ -z "${PARTITION}" ]; then PARTITION="gpu_4"; fi
 # BASE_DIR="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/"
 # BASE_DIR="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/"
 
-export PATH="$PATH:/home/kit/scc/qv2382/.local/bin"
+# export PATH="$PATH:/home/kit/scc/qv2382/.local/bin"
 
-# export EXT_DATA_PREFIX="/hkfs/home/dataset/datasets/"
-export EXT_DATA_PREFIX="/pfs/work7/workspace/scratch/qv2382-madonna-ddp/qv2382-madonna-ddp/datasets"
+BASE_DIR="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna"
+
+BASE_DIR="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/"
+export EXT_DATA_PREFIX="/hkfs/home/dataset/datasets/"
+TOMOUNT='/etc/slurm/task_prolog:/etc/slurm/task_prolog,'
+TOMOUNT+="${EXT_DATA_PREFIX},"
+TOMOUNT+="${BASE_DIR},"
+TOMOUNT+="/scratch,/tmp"
+
+ml purge
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 export UCX_MEMTYPE_CACHE=0
@@ -45,19 +53,12 @@ export SHARP_COLL_LOG_LEVEL=3
 export OMPI_MCA_coll_hcoll_enable=0
 export NCCL_SOCKET_IFNAME="ib0"
 export NCCL_COLLNET_ENABLE=0
-
-BASE_DIR="/pfs/work7/workspace/scratch/qv2382-madonna-ddp/qv2382-madonna-ddp/madonna"
-
-TOMOUNT='/etc/slurm/task_prolog.hk:/etc/slurm/task_prolog.hk,'
-TOMOUNT+="${EXT_DATA_PREFIX},"
-TOMOUNT+="${BASE_DIR},"
-TOMOUNT+="/scratch,/tmp,"
-TOMOUNT+="/home/kit/scc/qv2382/"
+export WANDB_API_KEY="4a4a69b3f101858c816995e6dfa553718fdf0dbe"
 # TOMOUNT+="/hkfs/work/workspace/scratch/qv2382-dlrt2/datasets"
 
 export TOMOUNT=$TOMOUNT
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/intel/lib/intel64
-export PATH="$PATH:/home/kit/scc/qv2382/.local/bin"
+# export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/intel/lib/intel64
+# export PATH="$PATH:/home/kit/scc/qv2382/.local/bin"
 # gpu_4_h100
 
 salloc \
@@ -65,4 +66,4 @@ salloc \
   -N "${SLURM_NNODES}" \
   --time "${TIMELIMIT}" \
   --gres gpu:"${GPUS_PER_NODE}" #\
-  # -A hk-project-test-mlperf \
+  -A hk-project-madonna \

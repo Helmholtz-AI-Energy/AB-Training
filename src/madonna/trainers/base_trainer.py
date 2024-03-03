@@ -37,10 +37,9 @@ class BasicTrainer(object):
         self.infloader = CycleDataLoader(train_loader)
         self.metrics = metrics
         self.lr_scheduler = lr_scheduler
-        self.total_train_iterations, self.current_iter = (
-            0,
-            0,
-        )  # TODO: is having this set to 1 the cause of the issues???
+        self.total_train_iterations = 0
+        self.current_iter = 0
+        self.lr_updates = 0
         self.max_train_iters = max_train_iters
         if iterations_per_train is None:
             log.info(f"No iterations per train specified, using len(train_loader): {len(train_loader)}")
@@ -49,7 +48,7 @@ class BasicTrainer(object):
             self.iterations_per_train = iterations_per_train
 
         if dist.is_initialized():
-            self.rank = dist.get_rank()
+            self.rank = dist.get_global_rank()
             self.world_size = dist.get_world_size()
             self.logging_rank = logging_rank
         else:
@@ -128,7 +127,9 @@ class BasicTrainer(object):
         # LR scheduler
         self.total_train_iterations += 1
         self.current_iter += 1
-        self.lr_scheduler.step_update(num_updates=self.total_train_iterations, metric=loss)
+
+        self.lr_updates += 1
+        self.lr_scheduler.step_update(num_updates=self.lr_updates, metric=loss)
 
         return loss.item()
 

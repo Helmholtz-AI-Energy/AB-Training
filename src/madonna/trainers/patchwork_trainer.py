@@ -151,12 +151,12 @@ def main(config):  # noqa: C901
     if not config.cpu_training:
         model.cuda(gpu)
 
-    # if config.training.init_method.endswith("-sigma"):
-    #     madonna.utils.utils.modify_model_random_simgas(
-    #         model,
-    #         device=gpu,
-    #         mode="rand" if config.training.init_method == "random-sigma" else "ortho",
-    #     )
+    if config.training.init_method.endswith("-sigma"):
+        madonna.utils.utils.modify_model_random_simgas(
+            model,
+            device=gpu,
+            mode=config.training.init_method,
+        )
 
     # if config.training.sync_batchnorm and dist.is_initialized():
     #     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)

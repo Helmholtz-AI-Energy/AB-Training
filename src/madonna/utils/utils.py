@@ -168,11 +168,11 @@ def modify_model_random_simgas(model: nn.Module, device: torch.device, mode: str
             'rand' - sigmas are rolled randomly everywhere
             'ortho' - sigmas are set to one
     """
-    if mode not in ["rand", "ortho"]:
-        raise ValueError(f"mode arg must be in {['rand', 'ortho']}, currently: {mode}")
+    # if mode not in ["rand", "ortho"]:
+    #     raise ValueError(f"mode arg must be in {['rand', 'ortho']}, currently: {mode}")
     if not dist.is_initialized():
         return
-    log.info("Rolling rankdom sigma values for multi dim weights")
+    log.info(f"Changing sigma values for multi dim weights: method: {mode}")
     # check if seeds are equal
     rank = dist.get_rank()
     ws = dist.get_world_size()
@@ -199,8 +199,12 @@ def modify_model_random_simgas(model: nn.Module, device: torch.device, mode: str
         if trans:  # make 2D rep TS
             hld = hld.T
         u, s, vh = torch.linalg.svd(hld, full_matrices=False)
-        if mode == "ortho":
+        if mode == "ortho-sigma":
             news = torch.ones_like(s)
+        elif mode == "sloped-sigma":
+            decay_factor = torch.tensor(0.1)
+            exponents = torch.arange(s.shape[0], dtype=s.dtype, device=s.device)
+            news = s[0] * 2 * decay_factor**exponents
         else:
             news = torch.rand(s.shape[0], device=s.device, dtype=s.dtype, generator=gen)
             news *= s[0]

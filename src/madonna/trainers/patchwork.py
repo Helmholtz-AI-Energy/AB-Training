@@ -50,6 +50,8 @@ class PatchworkSVDTrainer(BasicTrainer):
         self.steps_btw_syncing = config.training.patchwork_svd.steps_btw_syncing
         self.ddp_steps_after_sync = config.training.patchwork_svd.ddp_steps_after_sync
         self.zero_small_sig_vals = config.training.patchwork_svd.zero_small_sig_vals
+        self.use_pruning = config.training.patchwork_svd.use_pruning
+        self.reset_lr_on_sync = config.training.patchwork_svd.reset_lr_on_sync
 
         if config.training.patchwork_svd.names_to_always_sync is None:
             names_to_always_sync = []
@@ -99,16 +101,16 @@ class PatchworkSVDTrainer(BasicTrainer):
         # start in warmup mode (standard global DDP)
         self.sync_bn = config.training.sync_batchnorm
         self.no_ddp = True
+
+        if self.sync_bn:
+            self.sbn_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model).to(device)
+
         if self.warmup_steps > 0:
-            ddp_model = DDP(self.model)
-            if self.sync_bn:
-                ddp_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ddp_model).to(device)
+            ddp_model = DDP(self.sbn_model)
             self.no_ddp = False
         elif len(self.names_to_always_sync) != 0:
-            self.model._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
-            ddp_model = DDP(self.model)
-            if self.sync_bn:
-                ddp_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ddp_model).to(device)
+            self.sbn_model._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
+            ddp_model = DDP(self.sbn_model)
             self.no_ddp = False
 
         if config.training.init_method == "rand-sigma":
@@ -136,7 +138,6 @@ class PatchworkSVDTrainer(BasicTrainer):
         elif config.training.init_method == "sloped-sigma":
             rank = dist.get_rank()
             local_seed = torch.random.initial_seed() + rank
-            # self.local_gen = torch.Generator(device=device).manual_seed(local_seed)
             with torch.no_grad():
                 for n, p in self.model.named_parameters():
                     if n not in self.ddp_params_and_buffers_to_ignore:  # in self.names_to_always_sync:
@@ -148,8 +149,6 @@ class PatchworkSVDTrainer(BasicTrainer):
                     decay_factor = torch.tensor(0.1)
                     exponents = torch.arange(s.shape[0], dtype=s.dtype, device=s.device)
                     new_s = s[0] * 2 * decay_factor**exponents
-                    # rand = torch.rand_like(s)
-                    # new_s = s[order] * rand
 
                     hld = u @ new_s.diag() @ vh
                     if trans:
@@ -160,6 +159,24 @@ class PatchworkSVDTrainer(BasicTrainer):
 
         if self.warmup_steps > 0 or len(self.names_to_always_sync) != 0:
             self.model_to_run = ddp_model  # ddp on all ranks
+        # if self.logging_rank == self.rank:
+        #     print(self.model_to_run)
+
+        # LR Rebound phase ------------------------------
+        self.in_lr_rebound = False
+        self.lr_rebound_steps = config.training.patchwork_svd.lr_rebound_steps
+        self.current_lr_rebound_step = 0
+        self.lr_rebound_step_factor = [0] * len(self.optimizer.param_groups)
+        self.warmup_lr = config.training.lr_schedule.warmup_lr
+        # -----------------------------------------------
+
+    def _setup_lr_rebound(self):
+        self.in_lr_rebound = True
+        self.current_lr_rebound_step = 0
+        for c, pg in enumerate(self.optimizer.param_groups):
+            target_lr = self.lr_scheduler._get_lr(self.lr_updates + self.lr_rebound_steps)[c]
+            self.lr_rebound_step_factor[c] = (target_lr - self.warmup_lr) / self.lr_rebound_steps
+            pg["lr"] = self.warmup_lr
 
     @torch.no_grad()
     def _parchwork_sync(self):
@@ -631,6 +648,18 @@ class PatchworkSVDTrainer(BasicTrainer):
         for w in waits:
             w.wait()
 
+    def _pre_forward(self):
+        if not self.in_lr_rebound:
+            return
+        # if not in reboud, act normally. otherwise, increase the lr by lr_rebound_factor
+        self.current_lr_rebound_step += 1
+        for c, pg in enumerate(self.optimizer.param_groups):
+            pg["lr"] = self.lr_rebound_step_factor[c] * self.current_lr_rebound_step
+            if self.logging_rank == self.rank and self.current_lr_rebound_step % 10 == 0:
+                log.info(f"In LR rebound: actual LR: {pg['lr']:.6f}")
+        if self.current_lr_rebound_step >= self.lr_rebound_steps:
+            self.in_lr_rebound = False
+
     @torch.no_grad()
     def _post_train_step(self):
         # def _pre_forward(self):
@@ -644,12 +673,28 @@ class PatchworkSVDTrainer(BasicTrainer):
                     f"End of Warmup: {self.total_train_iterations} current epoch: {self.current_iter}/{self.iterations_per_train}",
                 )
             # if warmup is done, transition to individual mode
-            self.model._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
+            # params = {}
+            # for n, p in self.model_to_run.named_parameters():
+            #     params[n] = p.clone().detach()
+            if isinstance(self.model_to_run, DDP):
+                self.model_to_run = self.model_to_run.module
+            self.model_to_run._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
+            # if self.rank == self.logging_rank:
+            #     print(self.ddp_params_and_buffers_to_ignore, type(self.model_to_run))
+
             # self.model_to_run = DDP(self.model) if len(self.names_to_always_sync) > 0 else self.model
             # self.model._ddp_params_and_buffers_to_ignore = self.names_to_not_average
-            self.model_to_run = DDP(self.model)
-            if self.sync_bn:
-                self.model_to_run = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model_to_run).to(self.device)
+
+            self.model_to_run = DDP(self.model_to_run)
+
+            if self.comm_reset_opt_on_sync:
+                for p in self.model_to_run.parameters():
+                    utils.reset_adam_state(self.optimizer, p)
+            if self.reset_lr_on_sync:
+                self._setup_lr_rebound()
+
+            # if self.rank == self.logging_rank:
+            #     print(self.model_to_run)
         elif (
             self.total_train_iterations % self.steps_btw_syncing == 0
             and self.total_train_iterations > self.warmup_steps
@@ -667,7 +712,9 @@ class PatchworkSVDTrainer(BasicTrainer):
             # self._parchwork_sync()
 
             # -------- undo pruning and add models together -----------
-            # reset_model_pruning(self.model_to_run)
+            if self.use_pruning:
+                reset_model_pruning(self.model_to_run)
+            basis.compare_bases_across_ranks(self.model_to_run)
 
             for n, p in list(self.model_to_run.named_parameters()):
                 # parts = n.split(".")
@@ -726,8 +773,12 @@ class PatchworkSVDTrainer(BasicTrainer):
                 self.model_to_run = self.model_to_run.module
             self.model_to_run._ddp_params_and_buffers_to_ignore = []
             self.model_to_run = DDP(self.model_to_run)
-            if self.sync_bn:
-                self.model_to_run = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model_to_run).to(self.device)
+
+            if self.reset_lr_on_sync:
+                self._setup_lr_rebound()
+
+            # if self.rank == self.logging_rank:
+            #     print(self.model_to_run)
 
             # self.model_to_run = self.model
         elif (
@@ -740,7 +791,7 @@ class PatchworkSVDTrainer(BasicTrainer):
             # for now, can just have this be blocking
             if self.rank == self.logging_rank:
                 log.info(
-                    f"Compare sigma distribution: {self.total_train_iterations} "
+                    f"SWITCH TO INDV TRAINING\nCompare sigma distribution: {self.total_train_iterations} "
                     f"current epoch: {self.current_iter}/{self.iterations_per_train}",
                 )
 
@@ -754,8 +805,6 @@ class PatchworkSVDTrainer(BasicTrainer):
                 self.model_to_run = self.model_to_run.module
             self.model_to_run._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
             self.model_to_run = DDP(self.model_to_run)
-            if self.sync_bn:
-                self.model_to_run = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model_to_run).to(self.device)
 
             for n, p in list(self.model_to_run.named_parameters()):
                 # parts = n.split(".")
@@ -838,42 +887,11 @@ class PatchworkSVDTrainer(BasicTrainer):
                 #         )
                 # -----------------------------------------
 
-                # if self.rank == self.logging_rank:
-                #     log.info(f"Removing sigma vals")
-                # for n, p in self.model.named_parameters():
-                #     parts = n.split('.')
-                #     module_n = '.'.join(parts[:-1])
-                #     if n not in self.ddp_params_and_buffers_to_ignore or p.ndim == 1:
-                #         continue
-                #     else:
-                #         two_d_repr, trans, shp = basis.get_2d_repr(p)
-
-                #         u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
-                #         if self.rank == self.logging_rank:
-                #             nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
-                #             nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
-                #             nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
-
-                #             print(
-                #                 f"{n}: {s.mean():.4f}, {s.min():.4f}, {s.max():.4f} "
-                #                 f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
-                #                 f"<50% of first: {nz50perc:.4f}",
-                #             )
-                # # u[int(u.shape[0] * self.comm_percent_to_send):] *= 0
-                # s[int(s.shape[0] * self.comm_percent_to_send):] *= 0
-                # # vh[:, int(vh.shape[0] * self.comm_percent_to_send):] *= 0
-                # hld = u @ s.diag() @ vh
-                # if trans:
-                #     hld = hld.T
-                # hld = hld.view(shp)
-                # p.zero_()
-                # p.add_(hld)
-
-                # s = torch.linalg.svdvals(two_d_repr)
-
                 if self.comm_reset_opt_on_sync:
                     utils.reset_adam_state(self.optimizer, p)
-            # self.model_to_run = self.model
+
+            if self.reset_lr_on_sync:
+                self._setup_lr_rebound()
 
     def _log_train(self, loss):
         # todo: metrics...
@@ -883,6 +901,13 @@ class PatchworkSVDTrainer(BasicTrainer):
             self.metrics.display(self.current_iter - 1)
         except AttributeError:
             pass
+        out_lrs = []
+        prnt_str = "LRs: "
+        for group in self.optimizer.param_groups:
+            out_lrs.append(group["lr"])
+            prnt_str += f"group {len(out_lrs)}: lr {group['lr']:.6f}\t"
+        print(prnt_str)
+        # return out_lrs, prnt_str
 
 
 def get_prune_mask_from_2d_repr(twodimrepr, trans, shp, start, stop, dim=0):

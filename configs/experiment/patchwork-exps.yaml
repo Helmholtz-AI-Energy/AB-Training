@@ -29,9 +29,9 @@ training:
   sync_batchnorm: True
   init_method: ortho-sigma  # options: random, unified, rand-sigma, ortho-sigma
   patchwork_svd:
-    warmup_steps: 0
-    steps_btw_syncing: 2400
-    ddp_steps_after_sync: 1000
+    warmup_steps: 6000
+    steps_btw_syncing: 1200
+    ddp_steps_after_sync: 600
     zero_small_sig_vals: False
     names_to_always_sync: # null
       - fc.weight
@@ -44,7 +44,10 @@ training:
     comm_kwargs:
       percent_to_send: 0.25
     cat1d: False
-    reset_opt: True
+    reset_opt: False
+    use_pruning: False
+    reset_lr_on_sync: True
+    lr_rebound_steps: 150
   # optimizer:
   #   _partial_: True
   #   _target_: torch.optim.SGD

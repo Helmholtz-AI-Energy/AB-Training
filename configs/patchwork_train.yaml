@@ -2,7 +2,7 @@
 
 defaults:
   - _self_
-  - data: imagenet.yaml # cifar10.yaml #
+  - data: imagenet.yaml #cifar10.yaml #
   - model: resnet.yaml # vit.yaml # resnet-rs.yaml # cirsean4.yaml # conv_dense.yaml #
   - tracking: wandb.yaml  # mlflow.yaml # set tracking here or use command line (e.g. `python train.py tracking=tensorboard`)
   - training: patchwork_trainer_conf.yaml

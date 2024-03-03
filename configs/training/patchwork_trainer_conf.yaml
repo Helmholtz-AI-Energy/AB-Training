@@ -72,3 +72,5 @@ patchwork_svd:
     percent_to_send: 0.25
   cat1d: True
   reset_opt: False
+  reset_lr_on_sync: True
+  lr_rebound_steps: 50
