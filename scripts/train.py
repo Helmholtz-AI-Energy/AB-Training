@@ -48,6 +48,8 @@ def main(config: DictConfig):
         fn = madonna.trainers.ortho_fix_train.main
     elif config.training.trainer == "patchwork_trainer":
         fn = madonna.trainers.patchwork_trainer.main
+    elif config.training.trainer == "ab_trainer":
+        fn = madonna.trainers.ab_trainer.main
     elif config.training.trainer == "fed_train":
         fn = madonna.trainers.fed_train.main
     else:

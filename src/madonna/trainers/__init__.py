@@ -1,4 +1,5 @@
 from . import (
+    ab_trainer,
     base_trainer,
     fed_train,
     lr_dist_trainer,

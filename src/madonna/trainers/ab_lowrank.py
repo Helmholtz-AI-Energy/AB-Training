@@ -1,17 +1,20 @@
 import logging
 import time
 from copy import deepcopy
+from typing import cast
 
 import scipy
 import torch
 import torch.distributed as dist
 import torch.nn.utils.prune as prune
+from omegaconf import open_dict
 from torch.nn.modules import Module
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torchmetrics import MetricCollection
 
-from ..models import ab_lr
+from ..models.ab_lowrank_model import utils as ab_utils
+from ..optimizers import utils as opt_utils
 from ..utils import basis, mixing, rgetattr, utils
 from .base_trainer import BasicTrainer
 
@@ -45,26 +48,20 @@ class ABLowRankTrainer(BasicTrainer):
             logging_rank=config.tracking.logging_rank,
         )
         self.config = config
-        """
-        """
         self.warmup_steps = config.training.ab.warmup_steps
         self.steps_btw_syncing = config.training.ab.steps_btw_syncing
         self.ddp_steps_after_sync = config.training.ab.ddp_steps_after_sync
-        self.zero_small_sig_vals = config.training.ab.zero_small_sig_vals
-        self.use_pruning = config.training.ab.use_pruning
         self.reset_lr_on_sync = config.training.ab.reset_lr_on_sync
-
         # ---------------- MISC THINGS ---------------------------------------------------------
         self.comm_generator = torch.Generator().manual_seed(123456)  # no device -> use cpu
         self.local_model = self.model
         # --------------------------------------------------------------------------------------
-
-        self.model = ab_lr.convert_network_ab_lowrank(self.model, config)
-
         # ------------------------ SYNC / COMM MODES -------------------------------------
         self.sync_mode = config.training.ab.sync_mode
-        if self.sync_mode not in ["full", "with-stale", "only-learned"]:
-            raise ValueError(f"sync mode must be one of [full, with-stale, only-learned], current: {self.sync_mode}")
+        if self.sync_mode not in ["full", "with-stale", "only-learned", "only-b"]:
+            raise ValueError(
+                f"sync mode must be one of [full, with-stale, only-learned, only-b], current: {self.sync_mode}",
+            )
         # for more info on how syncing works, see self._sync_processes
 
         # TODO: clean me up...
@@ -72,23 +69,69 @@ class ABLowRankTrainer(BasicTrainer):
         if self.ab_train_comm_setup not in ["individual", "groups"]:
             raise ValueError(f"AB train mode must be one of [individual, groups], current: {self.ab_train_comm_setup}")
 
-        if config.training.ab.training_mode == "groups":
+        if config.training.ab.train_comm_setup == "groups":
             self.use_groups = True
         else:
             self.use_groups = False
 
+        if self.use_groups and self.sync_mode == "only-b" and self.im_logging_rank:
+            log.info("Using 'only-b' syncing and groups is synchronous DDP on only B (Simga @ Vt)")
+
         # create the sub-groups in all cases, doesnt hurt (TODO: check that...)
         all_ranks = list(range(0, dist.get_world_size()))
+        if config.training.ab.group_size == -1:
+            group_ranks = [all_ranks[0 : len(all_ranks) // 2], all_ranks[len(all_ranks) // 2 :]]
+            num_groups = 2
+        else:
+            group_size = config.training.ab.group_size
+            # increase group size if needed
+            num_groups = self.world_size // group_size
+            num_rem_ranks = self.world_size % group_size
+            group_sizes = [group_size] * num_groups
+            for r in range(num_rem_ranks):
+                group_sizes[r] += 1
+            group_ranks = []
+            for r in range(num_groups):
+                group_ranks.append(all_ranks[sum(group_sizes[:r]) : sum(group_sizes[: r + 1])])
 
         # Create two new groups of equal size
-        self.group_a_ranks = all_ranks[0 : len(all_ranks) // 2]
-        self.group_b_ranks = all_ranks[len(all_ranks) // 2 :]
+        if not self.sync_mode == "only-b":
+            self.num_a_groups = len(group_ranks[: num_groups // 2])
+            self.num_b_groups = len(group_ranks[num_groups // 2 :])
+            a_groups = torch.tensor(group_ranks[: num_groups // 2])
+            b_groups = torch.tensor(group_ranks[num_groups // 2 :])
 
-        self.group_a = dist.new_group(ranks=self.group_a_ranks, use_local_synchronization=True)
-        self.group_b = dist.new_group(ranks=self.group_b_ranks, use_local_synchronization=True)
+            self.group_a_ranks = a_groups.flatten().tolist()
+            self.group_b_ranks = b_groups.flatten().tolist()
+            local_ab_group, self.a_groups = dist.new_subgroups_by_enumeration(a_groups)
+            if local_ab_group is not None:
+                self.my_ab_group = local_ab_group
+                self.my_train_ab_mode = "a"
 
-        self.my_train_ab_mode = "a" if self.rank in self.group_a_ranks else "b"
-        self.my_ab_group = self.group_a if self.rank in self.group_a_ranks else self.group_b
+            local_ab_group, self.b_groups = dist.new_subgroups_by_enumeration(b_groups)
+            if local_ab_group is not None:
+                self.my_ab_group = local_ab_group
+                self.my_train_ab_mode = "b"
+
+            self.full_a_group = dist.new_group(self.group_a_ranks, use_local_synchronization=True)
+            self.full_b_group = dist.new_group(self.group_b_ranks, use_local_synchronization=True)
+
+        else:
+            self.num_a_groups = 0
+            self.num_b_groups = len(group_ranks)
+            self.group_a_ranks = []
+
+            b_groups = group_ranks
+            self.group_b_ranks = b_groups.flatten().tolist()
+            self.a_groups = []
+            self.b_groups = []
+            for gr in b_groups:
+                self.b_groups.append(dist.new_group(ranks=gr, use_local_synchronization=True))
+                if self.rank in gr:
+                    self.my_ab_group = self.b_groups[-1]
+                    self.my_train_ab_mode = "b"
+            self.full_a_group = None
+            self.full_b_group = None  # both are the full normal world
 
         if config.training.ab.full_rank_sync_names is None:
             full_rank_sync_names = []
@@ -101,26 +144,57 @@ class ABLowRankTrainer(BasicTrainer):
         # names to not sync during individual training
         # self.ddp_params_and_buffers_to_ignore = []
 
+        if config.training.ab.sync_mode == "only-b":
+            if self.im_logging_rank:
+                log.info("Setting split sigma to False for only-b training")
+            with open_dict(config):
+                config.training.ab.split_sigma = False
+        # Create a list of modules to ignore from the specified weights
+        skip_modules = []
+        for n in self.full_rank_sync_names:
+            mod_name = n.split(".")[:-1]
+            layer_name = ".".join(mod_name)
+            skip_modules.append(rgetattr(model, layer_name))
+
+        self.model = ab_utils.convert_network_ab_lowrank(self.model, config, skip_modules)
+        self.model.train()
+
         # Get lists of param names: always sync in full, 1d, multi-dim weights, a, b
-        self.param_name_lists = {"always sync": [], "1d": [], "Nd": [], "a": [], "b": []}
-        for n, p in model.named_parameters():
+        self.param_name_lists = {"always-sync": [], "1d": [], "Nd": [], "a": [], "b": []}
+        params_to_add_to_opt = []
+        for n, p in self.model.named_parameters():
             if n in self.full_rank_sync_names or len(full_rank_sync_names) == 0:
-                self.param_name_lists["always sync"].append(n)
+                self.param_name_lists["always-sync"].append(n)
             elif p.squeeze().ndim == 1:
                 self.param_name_lists["1d"].append(n)
-            elif n.endswith(".weight"):  # TODO: there should be a better rule here...
-                # should be only weights with > 1D now, A/B will have different names
-                self.param_name_lists["Nd"].append(n)
             elif n.endswith(".a"):
                 self.param_name_lists["a"].append(n)
+                params_to_add_to_opt.append(p)
             elif n.endswith(".b"):
                 self.param_name_lists["b"].append(n)
+                params_to_add_to_opt.append(p)
+            elif n.endswith((".weight", "full_rank_weight")):  # TODO: there should be a better rule here...
+                # should be only weights with > 1D now, A/B will have different names
+                # need to add another thing here to have the base_layer in the name
+                self.param_name_lists["Nd"].append(n)
+                params_to_add_to_opt.append(p)
             else:
                 raise ValueError(f"name: {n} not accounted for in lists")
-        # --------------------------------------------------------------------------------
+        # ------------------------------- ADD A/B TO OPTIMIZER ----------------------------
+        # remove old param group, then add a new one with all the params
+        # assuming that there is only one params group.....
+        # taken from Optimizer.init
+        params = self.model.parameters()
+        self.optimizer.param_groups = []
+        param_groups = list(params)
+        if len(param_groups) == 0:
+            raise ValueError("optimizer got an empty parameter list")
+        if not isinstance(param_groups[0], dict):
+            param_groups = [{"params": param_groups}]
 
+        for param_group in param_groups:
+            self.optimizer.add_param_group(cast(dict, param_group))
         # -------------------------------- DDP + WARMUP SETUP ------------------------------
-        self.comm_reset_opt_on_sync = config.training.ab.reset_opt
 
         # start in warmup mode (standard global DDP)
         self.sync_bn = config.training.sync_batchnorm
@@ -133,7 +207,7 @@ class ABLowRankTrainer(BasicTrainer):
             # starting in warmup phase
             templ = self.param_name_lists["a"] + self.param_name_lists["b"]
             self.sbn_model._ddp_params_and_buffers_to_ignore = templ
-            ab_lr.change_ab_train_mode(  # TODO: test me, unsure if this will fail
+            ab_utils.change_ab_train_mode(  # TODO: test me, unsure if this will fail
                 self.sbn_model,
                 ab_training_mode="full",
                 cut_singular_values=False,
@@ -142,20 +216,20 @@ class ABLowRankTrainer(BasicTrainer):
         else:
             # no warmup, starting in AB training
             # TODO: set up logic for different syncing modes
-            ab_lr.change_ab_train_mode(
+            ab_utils.change_ab_train_mode(
                 self.sbn_model,
                 ab_training_mode=self.my_train_ab_mode,
                 cut_singular_values=False,
             )
 
-            ign = self.param_name_lists["Nd"] + self.param_name_lists["a" if self.my_ab_group == "b" else "b"]
+            ign = self.param_name_lists["Nd"] + self.param_name_lists["a" if self.my_train_ab_mode == "b" else "b"]
             self.sbn_model._ddp_params_and_buffers_to_ignore = ign
             ddp_model = DDP(self.sbn_model, process_group=self.my_ab_group)
 
         if self.warmup_steps > 0 or len(self.names_to_always_sync) != 0:
             self.model_to_run = ddp_model  # ddp on all ranks
         # ----------------------------------------------------------------------------------
-
+        self.comm_reset_opt_on_sync = config.training.ab.reset_opt
         # ------------------------- LR Rebound ------------------------------
         self.in_lr_rebound = False
         self.lr_rebound_steps = config.training.ab.lr_rebound_steps
@@ -170,52 +244,148 @@ class ABLowRankTrainer(BasicTrainer):
             model = self.model_to_run.module
         else:
             model = self.model_to_run
-        ab_lr.change_ab_train_mode(
+        ab_utils.change_ab_train_mode(
             model,
             ab_training_mode=self.my_train_ab_mode,
             cut_singular_values=cut_singular_values,
         )
-        ign = self.param_name_lists["Nd"]
+        # need to resize the optimizer states after change ab_train_mode
+        if cut_singular_values:
+            opt_utils.change_adam_shapes(self.optimizer)
+
+        logmsg = f"AB Training: mode {self.my_train_ab_mode}\tDDP Ignore list includes: Nd, "
+        nd = self.param_name_lists["Nd"]
         if self.ab_train_comm_setup == "groups":
-            ign += self.param_name_lists["a" if self.my_ab_group == "b" else "b"]
+            ab = "a" if self.my_train_ab_mode == "b" else "b"
+            ign = nd + self.param_name_lists[ab]
+            logmsg += f"{ab}, "
         elif self.ab_train_comm_setup == "individual":
-            ign += self.param_name_lists["a"] + self.param_name_lists["b"]
+            ign = nd + self.param_name_lists["a"] + self.param_name_lists["b"]
+            logmsg += "A, B"
         else:
             raise ValueError(
                 f"self.ab_train_comm_setup must be either 'groups' or 'individual': current {self.ab_train_comm_setup}",
             )
 
+        if self.im_logging_rank:
+            log.info(logmsg)
+
         model._ddp_params_and_buffers_to_ignore = ign
-        return DDP(model, process_group=self.my_ab_group)
+        dist.barrier(group=self.my_ab_group)
+        self.model_to_run = DDP(model, process_group=self.my_ab_group)
+
+    def _prep_full_rank_train(self):
+        if isinstance(self.model_to_run, DDP):
+            model = self.model_to_run.module
+        else:
+            model = self.model_to_run
+        ab_utils.change_ab_train_mode(
+            model,
+            ab_training_mode="full",
+            cut_singular_values=False,
+        )
+        ign = self.param_name_lists["a"] + self.param_name_lists["b"]
+        if self.im_logging_rank:
+            log.info("Full Rank Syncronous Training\tDDP Ignore list includes: A, B")
+        model._ddp_params_and_buffers_to_ignore = ign
+        self.model_to_run = DDP(model, process_group=None)
+        return self.model_to_run
 
     @torch.no_grad()
     def _sync_processes(self):
         # if in groups: need to average all non-AB ranks as well
+        sync_time = time.perf_counter()
         waits = []
-        if self.ab_train_comm_setup == "groups":
-            names_to_avg_1d = self.param_name_lists["1d"] + self.param_name_lists["always sync"]
-            for n, p in self.model_to_run.named_parameters():
+        mod = self.model_to_run if not isinstance(self.model_to_run, DDP) else self.model_to_run.module
+        if self.ab_train_comm_setup == "groups" and self.sync_mode != "only-b":
+            # need to average 1D and always sync here because they are only trained in the group
+            names_to_avg_1d = self.param_name_lists["1d"] + self.param_name_lists["always-sync"]
+            for n, p in mod.named_parameters():
                 if n in names_to_avg_1d:
                     waits.append(dist.all_reduce(p, op=dist.ReduceOp.AVG, async_op=True))
+
         # three options: full, with-stale, and only-learned
         # full mode: -> transition network to 'full' mode, do average
         if self.sync_mode == "full":
-            waits = self._full_sync(waits)
-        # TODO: finish me!!
-        # raise ValueError
+            waits = self._full_sync(waits, mod)
+        elif self.sync_mode == "with-stale":
+            waits = self._stale_sync(waits, mod)
+        elif self.sync_mode == "only-learned":
+            waits = self._only_learned_sync(waits, mod)
+        elif self.sync_mode == "only-b":
+            waits = self._only_b_sync(waits, mod)
+        if len(waits) == 0:
+            if self.im_logging_rank:
+                log.debug("No waits in outer 1D loop for sync_processes")
         for w in waits:
-            w.wait()
+            if w is not None:
+                w.wait()
 
-    def _full_sync(self, waits: list) -> list:
+        if self.im_logging_rank:
+            log.info(
+                f"Syncing processes. comm setup: {self.ab_train_comm_setup}. "
+                f"sync mode: {self.sync_mode}. time needed: {time.perf_counter() - sync_time}",
+            )
+        return mod
+
+    def _full_sync(self, waits: list, mod) -> tuple[list, torch.nn.Module]:
         # full mode: -> transition network to 'full' mode, do average
-        ab_lr.change_ab_train_mode(
+        ab_utils.change_ab_train_mode(
             self.model_to_run,
             ab_training_mode="full",
             cut_singular_values=False,
         )
-        for n, p in self.model_to_run.named_parameters():
+
+        for n, p in mod.named_parameters():
             if n in self.param_name_lists["Nd"]:
                 waits.append(dist.all_reduce(p, op=dist.ReduceOp.AVG, async_op=True))
+        return waits
+
+    def _stale_sync(self, waits: list, mod) -> tuple[list, torch.nn.Module]:
+        # 'with-stale' mode: -> average all 'a' weights, average all 'b' weights, find full-rank repr
+        ab = self.param_name_lists["a"] + self.param_name_lists["b"]
+        ab_waits = []
+        for n, p in mod.named_parameters():
+            if n in ab:
+                if not p.is_contiguous():
+                    p.set_(p.contiguous())
+                ab_waits.append(dist.all_reduce(p, op=dist.ReduceOp.AVG, async_op=True))
+        waits += ab_waits
+        return waits
+
+    def _only_learned_sync(self, waits: list, mod) -> tuple[list, torch.nn.Module]:
+        # 'only-learned' mode ->
+        #   'a' and 'b' are already the same within the groups, send them to the other group, find full-rank repr
+        #       need to average A between all the A groups, and B with all the B groups
+        ab_waits = []
+
+        for n, p in mod.named_parameters():
+            if n in self.param_name_lists["a"]:
+                # average A across a-groups
+                if self.num_a_groups > 1:
+                    dist.all_reduce(p, op=dist.ReduceOp.AVG, group=self.full_a_group)
+                root = self.group_a_ranks[0]
+                # send a to b-groups/all
+                ab_waits.append(dist.broadcast(p, src=root, async_op=True))
+            # send b to a-groups/all
+            if n in self.param_name_lists["b"]:
+                # average B across b-groups
+                if self.num_b_groups > 1:
+                    dist.all_reduce(p, op=dist.ReduceOp.AVG, group=self.full_b_group)
+                root = self.group_b_ranks[0]
+                # send a to b-groups/all
+                ab_waits.append(dist.broadcast(p, src=root, async_op=True))
+        waits += ab_waits
+        return waits
+
+    def _only_b_sync(self, waits: list, mod) -> tuple[list, torch.nn.Module]:
+        # 'with-stale' mode: -> average all 'a' weights, average all 'b' weights, find full-rank repr
+        ab_waits = []
+        for n, p in mod.named_parameters():
+            if n in self.param_name_lists["b"]:
+                ab_waits.append(dist.all_reduce(p, op=dist.ReduceOp.AVG, async_op=True))
+        waits += ab_waits
+        return waits
 
     def _setup_lr_rebound(self):
         self.in_lr_rebound = True
@@ -241,159 +411,74 @@ class ABLowRankTrainer(BasicTrainer):
 
     @torch.no_grad()
     def _post_train_step(self):
-        # def _pre_forward(self):
-        # select model for forward step
-        # if self.total_train_iterations < self.warmup_steps:
-        #     self.model_to_run = self.models['global']
-        # print(self.total_train_iterations, self.warmup_steps)
-
-        # TODO: remove no_ddp
-        if self.total_train_iterations == self.warmup_steps and not self.no_ddp:
+        # TODO: Docs
+        if self.total_train_iterations == self.warmup_steps:
             if self.rank == self.logging_rank:
                 log.info(
                     f"End of Warmup: {self.total_train_iterations} current epoch: {self.current_iter}/{self.iterations_per_train}",
                 )
-            # if warmup is done, transition to individual mode
-            if isinstance(self.model_to_run, DDP):
-                self.model_to_run = self.model_to_run.module
-            self.model_to_run._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
-            # if self.rank == self.logging_rank:
-            #     print(self.ddp_params_and_buffers_to_ignore, type(self.model_to_run))
-            self.model_to_run = DDP(self.model_to_run)
+            # if warmup is done, transition to AB training mode
+            self._prep_ab_train(cut_singular_values=False)
 
             if self.comm_reset_opt_on_sync:
-                for p in self.model_to_run.parameters():
+                for _n, p in list(self.model_to_run.named_parameters()):
                     utils.reset_adam_state(self.optimizer, p)
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
+
+            ab_utils.get_network_compression(self.model_to_run)
 
         elif (
             self.total_train_iterations % self.steps_btw_syncing == 0
             and self.total_train_iterations > self.warmup_steps
         ):
-            # # finish average here -> receive everything - wait? then we dont need to do the weighted average...
-            # # for now, can just have this be blocking
-
+            # Sync processes and start DDP training for full-rank data
             if self.rank == self.logging_rank:
                 log.info(
                     f"Sycning ranks - iteration: {self.total_train_iterations} "
-                    f"current epoch: {self.current_iter}/{self.iterations_per_train}",
+                    f"current epoch: {self.current_iter}/{self.iterations_per_train} "
+                    f"Method: {self.sync_mode}",
                 )
+            ab_utils.compare_basis_ab(self.model_to_run)
 
-            # # # basis.compare_bases_across_ranks(self.model)
-            # self._parchwork_sync()
+            synced_model = self._sync_processes()
+            self.model_to_run = synced_model
+            self._prep_full_rank_train()
 
-            # -------- undo pruning and add models together -----------
-            if self.use_pruning:
-                reset_model_pruning(self.model_to_run)
-            basis.compare_bases_across_ranks(self.model_to_run)
-
-            for n, p in list(self.model_to_run.named_parameters()):
-                # parts = n.split(".")
-                # module_n = ".".join(parts[:-1])
-                # if n not in self.ddp_params_and_buffers_to_ignore or p.ndim == 1:
-                # dist.all_reduce(p, op=dist.ReduceOp.AVG)
-                dist.all_reduce(p, op=dist.ReduceOp.AVG)
-                if p.ndim > 1 and self.zero_small_sig_vals:
-                    two_d_repr, trans, shp = basis.get_2d_repr(p)
-                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
-                    nz10 = torch.nonzero(s < s[0] * 0.1)
-                    if self.rank == self.logging_rank:
-                        # print(two_d_repr[:10, :10])
-                        nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
-                        nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
-                        nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
-
-                        # print(
-                        #     f"{n}: {s.mean():.4f}, {s.min():.4f}, {s.max():.4f} "
-                        #     f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
-                        #     f"<50% of first: {nz50perc:.4f}",
-                        # )
-                    if self.total_train_iterations >= self.steps_btw_syncing * 2:
-                        if self.rank == self.logging_rank:
-                            log.info(f"Removing {nz10perc * 100:.4f}% of sigma vals")
-                        u[:, nz10] *= 0
-                        s[nz10] *= 0
-                        vh[nz10] *= 0
-                        # vh[:, int(vh.shape[0] * self.comm_percent_to_send):] *= 0
-                        hld = u @ s.diag() @ vh
-                        if trans:
-                            hld = hld.T
-                        hld = hld.view(shp)
-                        p.zero_()
-                        p.add_(hld)
-                if self.comm_reset_opt_on_sync:
+            # Reset optimizer
+            if self.comm_reset_opt_on_sync:
+                for _n, p in list(self.model_to_run.named_parameters()):
                     utils.reset_adam_state(self.optimizer, p)
-
-            if isinstance(self.model_to_run, DDP):
-                self.model_to_run = self.model_to_run.module
-            self.model_to_run._ddp_params_and_buffers_to_ignore = []
-            self.model_to_run = DDP(self.model_to_run)
-
+            # start LR rebound
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
+            ab_utils.get_network_compression(self.model_to_run)
         elif (
-            self.total_train_iterations > self.warmup_steps
+            self.total_train_iterations > self.steps_btw_syncing
             and self.total_train_iterations % self.steps_btw_syncing == self.ddp_steps_after_sync
             # self.total_train_iterations % (self.steps_btw_syncing // 2) == 0
             # and self.total_train_iterations > self.warmup_steps
         ):
             # finish average here -> receive everything - wait? then we dont need to do the weighted average...
             # for now, can just have this be blocking
+
             if self.rank == self.logging_rank:
                 log.info(
-                    f"SWITCH TO INDV TRAINING\nCompare sigma distribution: {self.total_train_iterations} "
+                    f"SWITCH TO AB TRAINING\nCompare sigma distribution: {self.total_train_iterations} "
                     f"current epoch: {self.current_iter}/{self.iterations_per_train}",
                 )
 
-            basis.compare_bases_across_ranks(self.model_to_run)
+            ab_utils.compare_basis_ab(self.model_to_run)
 
-            # pruning tests: --------------------------
-            # if self.rank == self.logging_rank:
-            #     log.info(f"Removing sigma vals")
+            self._prep_ab_train(cut_singular_values=True)
 
-            if isinstance(self.model_to_run, DDP):
-                self.model_to_run = self.model_to_run.module
-            self.model_to_run._ddp_params_and_buffers_to_ignore = self.ddp_params_and_buffers_to_ignore
-            self.model_to_run = DDP(self.model_to_run)
-
-            for n, p in list(self.model_to_run.named_parameters()):
-                # parts = n.split(".")
-                # module_n = ".".join(parts[:-1])
-                if p.ndim > 1:
-                    two_d_repr, trans, shp = basis.get_2d_repr(p)
-                    u, s, vh = torch.linalg.svd(two_d_repr, full_matrices=False)
-                    # nz10 = torch.nonzero(s < s[0] * 0.1)
-                    if self.rank == self.logging_rank:
-                        # print(two_d_repr[:10, :10])
-                        nz10perc = torch.count_nonzero(s < s[0] * 0.1) / s.shape[0]
-                        nz1perc = torch.count_nonzero(s < s[0] * 0.01) / s.shape[0]
-                        nz50perc = torch.count_nonzero(s < s[0] * 0.5) / s.shape[0]
-
-                        print(
-                            f"{n}: {s.mean():.4f}, {s.min():.4f}, {s.max():.4f} "
-                            f"-- <10% of first: {nz10perc:.4f} <1% of first: {nz1perc:.4f} "
-                            f"<50% of first: {nz50perc:.4f}",
-                        )
-                    # if self.total_train_iterations > self.steps_btw_syncing * 2:
-                    #     if self.rank == self.logging_rank:
-                    #         log.info(f"Removing {nz10perc * 100:.4f}% of sigma vals")
-                    #     u[:, nz10] *= 0
-                    #     s[nz10] *= 0
-                    #     vh[nz10] *= 0
-                    #     # vh[:, int(vh.shape[0] * self.comm_percent_to_send):] *= 0
-                    #     hld = u @ s.diag() @ vh
-                    #     if trans:
-                    #         hld = hld.T
-                    #     hld = hld.view(shp)
-                    #     p.zero_()
-                    #     p.add_(hld)
-
-                if self.comm_reset_opt_on_sync:
+            if self.comm_reset_opt_on_sync:
+                for _n, p in list(self.model_to_run.named_parameters()):
                     utils.reset_adam_state(self.optimizer, p)
 
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
+            ab_utils.get_network_compression(self.model_to_run)
 
     def _log_train(self, loss):
         # todo: metrics...

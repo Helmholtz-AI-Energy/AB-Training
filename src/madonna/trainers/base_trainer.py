@@ -48,13 +48,15 @@ class BasicTrainer(object):
             self.iterations_per_train = iterations_per_train
 
         if dist.is_initialized():
-            self.rank = dist.get_global_rank()
+            self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
             self.logging_rank = logging_rank
         else:
             self.rank, self.logging_rank = 0, 0
             self.world_size = 1
         self.log_freq = log_freq
+
+        self.im_logging_rank = self.logging_rank == self.rank
 
         self.model_to_run = self.model
 

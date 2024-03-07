@@ -1,0 +1,73 @@
+# @package _global_
+
+training:
+  start_epoch: 0
+  epochs: 100
+  iterations_per_train: 300
+
+  # number of validation steps to execute at the beginning of the training
+  # num_sanity_val_steps: 0
+  trainer: "ab_trainer"
+  # ckpt path
+  checkpoint: null # /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models/baseine/vit_b_16-imagenet/epoch43.pth.tar #
+  checkpoint_out_root: null  #/hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/models
+  save_period: 25
+
+  lr: 0.001
+  lr_schedule:
+    sched: cosine  # cosine LR scheduler from timm
+    epochs: 100  # number of epochs for the cycle to run for
+    warmup_epochs: 1
+    min_lr: 0.01  # min LR of cosine annealing pattern
+    warmup_lr: 0.00001  # starting point of warmup
+    # warmup_prefix: False  # default
+    # lr_cycle_mul: 1.0  # default -> cycle length: int(math.floor(-self.t_initial * (self.cycle_mul ** cycles - 1) / (1 - self.cycle_mul)))
+    # lr_cycle_limit: 30
+    # lr_cycle_decay: 0.4  # NOTE: the implementation is wrong in the docs!! it should be that the decay_rate is lr_cycle_decay!!!
+    # lr_k_decay: 1.0  # default 1.0
+    # sched_on_updates: True
+  sync_batchnorm: True
+  init_method: ortho-sigma  # options: random, unified, rand-sigma, ortho-sigma
+  print_freq: 25
+  ab:
+    warmup_steps: 100
+    steps_btw_syncing: 500
+    ddp_steps_after_sync: 100
+    full_rank_sync_names: # null
+      - fc.weight
+      - fc.bias
+      - conv1.weight
+      # - cls_token
+      # - pos_embed
+      # - head.weight
+    reset_opt: False
+    reset_lr_on_sync: True
+    lr_rebound_steps: 150
+    # Low rank things
+    low_rank_cutoff: 0.1
+    sync_mode: only-learned  # options: full, with-stale, only-learned, only-b
+    # NOTE: only-b + groups will never get local divergences (no local group to do b on)
+    train_comm_setup: groups  # options: individual, groups
+    group_size: 2  # if -1 => 2 groups, split world in half
+    split_sigma: True
+  # optimizer:
+  #   _partial_: True
+  #   _target_: torch.optim.SGD
+  #   weight_decay: 0.00001
+  #   momentum: 0.9
+
+
+data:
+  timm_transforms: False
+  local_batch_size: 256
+  distributed_sample_val: True
+
+model:
+  autocast: True
+
+tracking:
+  logging_rank: 0
+
+name: ab-testing
+enable_tracking: False
+baseline: True
