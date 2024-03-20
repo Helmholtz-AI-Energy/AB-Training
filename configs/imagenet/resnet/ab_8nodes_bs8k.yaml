@@ -1,0 +1,17 @@
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/resnet/common.yaml
+name: ab-8k
+baseline: False
+tracking:
+  log_to_stdout: True
+  tags:
+    - scaling
+training:
+  iterations_per_train: 150
+  checkpoint: null
+  checkpoint_out_root: null
+  save_period: 25
+  ab:
+    warmup_steps: 4650  # 9300/2
+    steps_btw_syncing: 750  # 1500 /2
+    ddp_steps_after_sync: 150  # 300 /2
+    lr_rebound_steps: 325  # 750 /2

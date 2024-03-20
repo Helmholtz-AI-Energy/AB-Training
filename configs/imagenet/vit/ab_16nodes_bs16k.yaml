@@ -1,0 +1,18 @@
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/vit/common.yaml
+
+name: ab-16k
+baseline: False
+tracking:
+  log_to_stdout: True
+  tags:
+    - scaling
+training:
+  iterations_per_train: 75
+  checkpoint: null
+  checkpoint_out_root: null
+  save_period: 25
+  ab:
+    warmup_steps: 2325  # 9300/4
+    steps_btw_syncing: 375  # 1500 /4
+    ddp_steps_after_sync: 75  # 300 /4
+    lr_rebound_steps: 188  # 750 /4

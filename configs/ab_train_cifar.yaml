@@ -1,0 +1,151 @@
+log_output: null
+original_work_dir: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna
+print_config: false
+train: true
+validate: true
+test: false
+seed: null
+name: testing
+baseline: true
+comm_method: nccl
+cpu_training: false
+enable_tracking: true
+tracker: wandb
+data:
+  dataset: cifar100
+  data_dir_horeka: "/hkfs/home/dataset/datasets/CIFAR100/"
+  data_dir_uc2: "/pfs/work7/workspace/scratch/qv2382-madonna-ddp/qv2382-madonna-ddp/datasets/cifar100"
+  num_workers: 6
+  pin_memory: false
+  local_batch_size: 128
+  timm_transforms: False
+  persistent_workers: true
+  distributed_sample: True
+  distributed_sample_val: True
+  train_crop_size: 32
+  classes: 100
+model:
+  model:
+    _target_: timm.models.resnet50
+    drop_rate: 0.1
+  name: resnet50
+  autocast: true
+tracking:
+  logging_rank: 0
+  tracking_rank: 0
+  save_checkpoints: false
+  project: lr-dist
+  sweep: null
+  log_file_root: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/logs/experiments/runs/propulate/
+  log_to_stdout: True
+  # tags:
+  #   - propulate
+training:
+  start_epoch: 0
+  epochs: 150
+  iterations_per_train: 100
+  use_early_stopping: true
+  early_stopping:
+    0.04: 2.0
+    0.10: 4.0
+    0.4: 5.5
+    0.5: 6.0
+    0.75: 7.0
+  trainer: ab_trainer
+  checkpoint: null
+  checkpoint_out_root: null
+  save_period: 25
+  resume_run: false
+  resume: false
+  criterion:
+    _target_: torch.nn.CrossEntropyLoss
+    label_smoothing: 0.1
+  lr: 0.003
+  lr_schedule:
+    _target_: null
+    sched: cosine
+    epochs: 150
+    warmup_epochs: 8
+    cooldown_epochs: 10
+    min_lr: 1e-05
+    warmup_lr: 1e-05
+    warmup_prefix: true
+    lr_cycle_mul: 1.5
+    lr_cycle_limit: 30
+    lr_cycle_decay: 0.4
+    lr_k_decay: 1.0
+    sched_on_updates: true
+  sync_batchnorm: true
+  federated: false
+  mixup: false
+  mixup_args:
+    mixup_alpha: 0.8
+    cutmix_alpha: 0.0
+    cutmix_minmax: null
+    prob: 1.0
+    switch_prob: 0.5
+    mode: batch
+    num_classes: null
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    weight_decay: 0.4
+    beta1: 0.9
+    beta2: 0.999
+  max_grad_norm: 1.0
+  print_freq: 25
+  init_method: ortho-sigma
+  ab:
+    warmup_steps: 4330
+    steps_btw_syncing: 750
+    full_rank_sync_names:
+      - fc.weight  # resnet
+      - fc.bias  # resnet
+      - conv1.weight  # resnet
+      - cls_token  # vit
+      - pos_embed  # vit
+      - head.weight  # vit
+    ddp_steps_after_sync: 60
+    low_rank_cutoff: 0.1
+    sync_mode: with-stale  # options: full, with-stale, only-learned, only-b
+    # NOTE: only-b + groups will never get local divergences (no local group to do b on)
+    train_comm_setup: individual  # options: individual, groups
+    group_size: 1
+    split_sigma: true
+    reset_opt: false
+    reset_lr_on_sync: true
+    lr_rebound_steps: 100
+propulate:
+  ranks_per_worker: 4  # 1 node per worker, 4 workers/node
+  num_islands: 4
+  migration_probability: 0.9
+  crossover: 0.7
+  mutation: 0.4
+  random: 0.1
+  pollination: True
+  log_path: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/logs/propulate/cifar100-2/
+  checkpoint_path: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/hpsearch/cifar100-2/
+  search_space:
+    training.lr: [0.0001, 0.005]
+    training.max_grad_norm: [-1, 2]
+    # Optimizer things
+    training.optimizer.weight_decay: [0.001, 0.5]
+    # "training.optimizer.beta1": (0.01, 0.999),
+    # "training.optimizer.beta2": (0.01, 0.999),
+    # Scheduler stuff
+    training.lr_schedule.min_lr: [0.00001, 0.007]
+    training.lr_schedule.warmup_lr: [0.000005, 0.0002]
+    training.lr_schedule.lr_k_decay: [0.1, 2.0]
+    training.lr_schedule.warmup_epochs: [5, 20]
+    # AB stuff
+    training.ab.warmup_steps: [500, 5000]
+    training.ab.steps_btw_syncing: [100, 1000]
+    training.ab.ddp_steps_after_sync: [50, 100]
+    training.ab.low_rank_cutoff: [0.05, 0.5]
+    training.ab.sync_mode: [with-stale, only-learned, only-b]
+    training.ab.train_comm_setup: [individual, groups]
+    training.ab.group_size: [1, 2]
+    training.ab.split_sigma: [0, 1]
+    training.ab.reset_opt: [0, 1]
+    training.ab.reset_lr_on_sync: [0, 1]
+    training.ab.lr_rebound_steps: [150, 600]
