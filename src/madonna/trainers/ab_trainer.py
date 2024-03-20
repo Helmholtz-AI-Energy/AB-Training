@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
 import shutil
+import sys
 import time
 from collections import defaultdict
 from copy import deepcopy
@@ -12,8 +14,6 @@ from enum import Enum
 from pathlib import Path
 
 import hydra
-
-# from mpi4py import MPI
 import numpy as np
 
 # import cProfile, pstats, io
@@ -46,21 +46,68 @@ best_acc1 = 0
 log = logging.getLogger(__name__)
 
 
-def main(config):  # noqa: C901
-    # log.info(config)
-    hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
-    print(hydra_cfg["runtime"]["output_dir"])
-    # log.info("here is some log testing")
-    # log.info("more stuff")
-    # log.info("do i need more things?")
+def main(config, comm=None, subproc=False):  # noqa: C901
+    if comm is None and not subproc:
+        # want to avoide importing MPI on the subprocess
+        from mpi4py import MPI
+
+        comm = MPI.COMM_WORLD
+    else:
+        comm = "ignore"
+    # print('hh')
+    if not dist.is_initialized():
+        rank, size = madonna.utils.comm.init_and_set_config_rank_size(config, mpi_comm=comm)
+    else:
+        rank = dist.get_rank()
+        size = dist.get_world_size()
+    # print('hhh')
+    with open_dict(config):
+        config["world_size"] = size
+        config["rank"] = rank
+        config["global_batch_size"] = config.data.local_batch_size * size
+
+    if dist.is_initialized():
+        gpu = dist.get_rank() % torch.cuda.device_count()  # only 4 gpus/node
+        log.debug(f"Using GPU: {gpu}")
+    else:
+        log.info(f"available GPUS: {torch.cuda.device_count()}")
+        gpu = 0
+        # log.info(f"available GPUS: {torch.cuda.device_count()}")
+    torch.cuda.set_device(gpu)
+    device = torch.device(f"cuda:{gpu}")
+    # print('here')
     # raise ValueError
 
+    # raise ValueError
     # =========================================== logging / tracking init ========================
-    for handler in log.parent.handlers:
-        if isinstance(handler, logging.FileHandler):
-            log_file = handler.baseFilename
+    log_root = Path(config.tracking.log_file_root)
+    log_root = log_root / str(config.slurm_id)
+    counter = torch.tensor(0, dtype=torch.int, device=device)
+    if config.rank == 0:
+        log_root.mkdir(parents=True, exist_ok=True)
+        while (log_root / f"train{counter}.log").exists():
+            counter += 1
+
+    # counter = comm.bcast(counter, root=0)
+    dist.broadcast(counter, src=0, async_op=False)
+    counter = counter.item()
+    log_file = log_root / f"train{counter}.log"
+
+    log_file_handler = madonna.utils.set_logger_config(
+        level=logging.INFO,
+        log_file=log_file,
+        log_to_stdout=config.tracking.log_to_stdout,
+        log_rank=config.tracking.logging_rank,
+        colors=True,
+        existing_comm=comm,
+    )
+    # log.info(f"Test log: my worker rank: {comm.rank} size: {comm.size}, COMM_WORLD rank {MPI.COMM_WORLD.rank} size {MPI.COMM_WORLD.size}")
+    # print(rank, size)
+    if rank == 0:
+        log.info(f"Config: {config}")
+    # return ret_dict
     with open_dict(config):
-        config["log_file_out"] = log_file
+        config["log_file_out"] = str(log_file)
         if config.tracking.logging_rank == "all":  #
             config.tracking.logging_rank = config.rank
 
@@ -89,6 +136,7 @@ def main(config):  # noqa: C901
         last = wdir / "last.pt"
     else:
         wdir = None
+
     # results_file = save_dir / 'results.txt'
     # f = open(results_file, 'w')
     if config.rank == config.tracking.tracking_rank and config.enable_tracking:
@@ -97,16 +145,6 @@ def main(config):  # noqa: C901
         wandb_logger = None
 
     # =========================================== END logging / tracking init ========================
-
-    if dist.is_initialized():
-        gpu = dist.get_rank() % torch.cuda.device_count()  # only 4 gpus/node
-        log.debug(f"Using GPU: {gpu}")
-    else:
-        log.info(f"available GPUS: {torch.cuda.device_count()}")
-        gpu = 0
-        # log.info(f"available GPUS: {torch.cuda.device_count()}")
-    torch.cuda.set_device(gpu)
-    device = torch.device(f"cuda:{gpu}")
 
     # =========================================== Seed setting =======================================
     if config.seed is None:
@@ -157,17 +195,6 @@ def main(config):  # noqa: C901
             mode=config.training.init_method,
         )
 
-    # if config.training.federated and config.baseline:
-    # log.info("Using federated data scheme, model is not DDP")
-    # elif config.baseline:
-    #     model = DDP(model)  # , device_ids=[config.rank])
-    #     log.info("using DDP baseline model")
-    # else:
-    #     model_hold = hydra.utils.instantiate(config.training.fixing_method)
-    #     model = model_hold(model).to(device)
-    #     log.info("using SVD model")
-    # model_param_dict = madonna.lrsync.sync.get_param_dict_with_svds(model)
-
     criterion = madonna.utils.get_criterion(config)
     optimizer = madonna.utils.get_optimizer(config, model, lr=config.training.lr)
 
@@ -189,9 +216,10 @@ def main(config):  # noqa: C901
         lr_scheduler=scheduler,
         config=config,
         metrics=train_metrics,
+        tracker=wandb_logger,
     )
-    if config.rank == 0:
-        print(f"len dataloader: {len(trainer.infloader)}")
+    # if config.rank == 0:
+    #     print(f"len dataloader: {len(trainer.infloader)}")
 
     # optionally resume from a checkpoint
     # Reminder: when resuming from a single checkpoint, make sure to call init_model with
@@ -259,7 +287,18 @@ def main(config):  # noqa: C901
             train_sampler.set_epoch(epoch)
 
         trainer.metrics.reset(epoch, trainer.iterations_per_train)
-        train_metrics, train_time = trainer.train()
+        try:
+            train_metrics, train_time = trainer.train()
+        except ValueError as e:
+            if "NaN loss" in str(e):
+                ret_dict = {"train_loss": 10, "train_top1": 0, "val_loss": 10, "val_top1": 0}
+                ret_dict["train_top1"] = 2
+                ret_dict["val_top1"] = 2
+                # comm.barrier()
+                # dist.destroy_process_group(trainer.my_ab_group)
+                # dist.destroy_process_group()
+                madonna.utils.remove_logger(log_file_handler)
+                return ret_dict
 
         ls = train_metrics["loss"].item() if isinstance(train_metrics["loss"], torch.Tensor) else train_metrics["loss"]
         t1 = train_metrics["top1"].item() if isinstance(train_metrics["top1"], torch.Tensor) else train_metrics["top1"]
@@ -276,20 +315,34 @@ def main(config):  # noqa: C901
         if rank == config.tracking.logging_rank:
             log.info(f"End Train params avg across procs: loss: {ls:.4f}\ttop1: {t1:.4f}\ttop5: {t5:.4f}")
         # evaluate on validation set
-        val_top1, val_loss = validate(
-            val_loader=val_loader,
-            model=trainer.model_to_run,
-            criterion=criterion,
-            config=config,
-            device=device,
-            wandb_logger=wandb_logger if config.enable_tracking else None,
-            metrics=val_metrics,
-        )
+        try:
+            val_top1, val_loss = validate(
+                val_loader=val_loader,
+                model=trainer.model_to_run,
+                criterion=criterion,
+                config=config,
+                device=device,
+                wandb_logger=wandb_logger if config.enable_tracking else None,
+                metrics=val_metrics,
+            )
+        except ValueError as e:
+            if "NaN loss" in str(e):
+                ret_dict = {"train_loss": ls, "train_top1": t1, "val_loss": val_loss, "val_top1": val_top1}
+                ret_dict["train_top1"] = 2
+                ret_dict["val_top1"] = 2
+                # comm.barrier()
+                # dist.destroy_process_group(trainer.my_ab_group)
+                # dist.destroy_process_group()
+                madonna.utils.remove_logger(log_file_handler)
+                return ret_dict
 
         # if config.rank == 0:
         #     log.info(
         #         f"Average val loss across process space: {val_loss} " f"-> diff: {train_loss - val_loss}",
         #     )
+
+        if val_top1 > best_fitness:
+            best_fitness = val_top1
 
         # log metrics
         val_metrics_epoch = val_metrics.compute()
@@ -298,13 +351,11 @@ def main(config):  # noqa: C901
             "val/f1": val_metrics_epoch["MulticlassF1Score"],
             "val/precision": val_metrics_epoch["MulticlassPrecision"],
             "val/recall": val_metrics_epoch["MulticlassRecall"],
+            "val/bestt1": best_fitness,
             # "val/loss": val_loss,
         }
 
         # Save model
-        if dist.is_initialized():
-            wait = dist.barrier(async_op=True)
-
         if rank == config.tracking.logging_rank:
             log.info(
                 f"Epoch end metrics: "
@@ -328,9 +379,6 @@ def main(config):  # noqa: C901
                 slope, _ = np.polyfit(x=np.arange(10), y=np.array(last_val_top1s[-10:]), deg=1)
                 log.info(f"Slope of Top1 for last 10 epochs: {slope:.5f}")
 
-            if val_top1 > best_fitness:
-                best_fitness = val_top1
-
             wandb_logger.log(log_dict)
             wandb_logger.end_epoch(best_result=best_fitness == val_top1)
 
@@ -343,48 +391,58 @@ def main(config):  # noqa: C901
             #     print("After 1st save")
             if best_fitness == val_top1:
                 torch.save(ckpt, wdir / "best_{:03d}.pt".format(epoch))
-                print("After best save")
+                # print("After best save")
 
             if epoch == 0:  # first
                 torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
-                print("After 1st save")
+                # print("After 1st save")
             elif config.training.save_period != -1 and ((epoch + 1) % config.training.save_period) == 0:  # on command
                 torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
-                print("After periodic save")
+                # print("After periodic save")
             # elif epoch >= (config.training.epochs - 5):
             #     torch.save(ckpt, wdir / "epoch_{:03d}.pt".format(epoch))
 
             del ckpt
-        if dist.is_initialized():
-            # wait here for the saving and such...it didnt work to have it afterwards
-            wait.wait(timeout=timedelta(seconds=60))
-        # # early stopping for imagenet...
-        # if (val_top1 < 15. and epoch >= 5) or \
-        #    (val_top1 < 60. and epoch >= 25) or \
-        #    (val_top1 < 70. and epoch >= 50):  # or \
-        #     #    (val_top1 < 75. and epoch >= 70):  # or \
-        #     # (val_top1 < 78. and epoch >= 100):
-        #     if rank == 0:
-        #         log.info("Early stopping")
-        #     break
-        scheduler.step(epoch + 1, metric=val_loss)
+
+        # early stopping for imagenet...
+        if config.training.use_early_stopping:
+            stop = False
+            es_dict = config.training.early_stopping
+            for epoch_perc in es_dict:
+                if epoch >= epoch_perc * config.training.epochs and best_fitness < es_dict[epoch_perc]:
+                    log.info("Early stopping")
+                    stop = True
+                    break
+            if stop:
+                # need break outside for both for loops
+                break
+        # scheduler.step(epoch + 1, metric=val_loss)
         val_metrics.reset()
+
     if rank == config.tracking.tracking_rank and config.enable_tracking:
-        log.info("End of run")
         wandb_logger.finish_run()
-    # import json
-    # val_top1 = val_top1 if not isinstance(val_top1, torch.Tensor) else val_top1.item()
-    # ret_dict = {"train_loss": train_loss, "train_top1": train_t1, "val_loss": val_loss, "val_top1": val_top1}
-    # # propulate minimizes...
-    # ret_dict["train_top1"] = 1 - (ret_dict["train_top1"] * 0.01)
-    # ret_dict["val_top1"] = 1 - (ret_dict["val_top1"] * 0.01)
+
+    # --------------------- WRITE JSON WITH RESULTS --------------------------------------
+    val_top1 = val_top1 if not isinstance(val_top1, torch.Tensor) else val_top1.item()
+    ret_dict = {"train_loss": ls, "train_top1": t1, "val_loss": val_loss, "val_top1": val_top1}
+    # propulate minimizes...
+    ret_dict["train_top1"] = 1 - (ret_dict["train_top1"] * 0.01)
+    ret_dict["val_top1"] = 1 - (ret_dict["val_top1"] * 0.01)
     # print("from train", ret_dict)
-    # # out_file_root = Path("/hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/tmp/")
     # out_file = Path("/hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/tmp/")
+    # # TODO: change the rank for multi-rank propulate
     # with open(out_file / f"{os.environ['RANK']}-output.txt", "w") as convert_file:
     #     # convert_file.write(json.dumps(ret_dict))
     #     json.dump(ret_dict, convert_file)
-    # return ret_dict
+    # comm.barrier()
+    # time.sleep(comm.rank / 10)
+    # dist.destroy_process_group(trainer.my_ab_group)
+    # dist.destroy_process_group()
+    if rank == 0:
+        print(f"end of run see log file: {log_file}")
+    log.info("End of run")
+    # madonna.utils.remove_logger(log_file_handler)
+    return ret_dict
 
 
 def get_lrs(opt):
@@ -422,10 +480,7 @@ def validate(val_loader, model, criterion, config, device, wandb_logger, metrics
                     raise ValueError("NaN in images... - VAL")
 
                 # compute output
-                if config.baseline:
-                    output = model(images)
-                else:
-                    output, _ = model(images)
+                output = model(images)
                 loss = criterion(output, target)
                 # argmax = torch.argmax(output.output, dim=1).to(torch.float32)
 
@@ -450,8 +505,8 @@ def validate(val_loader, model, criterion, config, device, wandb_logger, metrics
                     progress.display(i + 1, log=log)
                 if i % 50 == 0 or i == num_elem:
                     argmax = torch.argmax(output, dim=1).to(torch.float32)
-                    print(
-                        f"output mean: {argmax.mean():.4f}, max: {argmax.max():.4f}, ",
+                    log.info(
+                        f"output mean: {argmax.mean():.4f}, max: {argmax.max():.4f}, "
                         f"min: {argmax.min():.4f}, std: {argmax.std():.4f}",
                     )
 

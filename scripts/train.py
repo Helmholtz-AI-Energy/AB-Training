@@ -38,11 +38,11 @@ def main(config: DictConfig):
     # optimizer = madonna.utils.get_optimizer(config, model)
     # sch, warmup = madonna.utils.get_lr_schedules(config, optimizer, 10)
     pprint("before comm init")
-    rank, size = utils.comm.init_and_set_config_rank_size(config)
-    with open_dict(config):
-        config["world_size"] = size
-        config["rank"] = rank
-        config["global_batch_size"] = config.data.local_batch_size * size
+    # rank, size = utils.comm.init_and_set_config_rank_size(config)
+    # with open_dict(config):
+    #     config["world_size"] = size
+    #     config["rank"] = rank
+    #     config["global_batch_size"] = config.data.local_batch_size * size
 
     if config.training.trainer == "ortho_fix_train":
         fn = madonna.trainers.ortho_fix_train.main
@@ -64,52 +64,43 @@ def main(config: DictConfig):
             wandb.agent(config.tracking.sweep, function=func, count=1)
         else:
             fn(config)
-    elif rank == 0 and config.enable_tracking and config.tracking == "mlflow":
-        import mlflow
+    # elif rank == 0 and config.enable_tracking and config.tracking == "mlflow":
+    #     import mlflow
 
-        _ = utils.tracking.setup_mlflow(config, verbose=False)
+    #     _ = utils.tracking.setup_mlflow(config, verbose=False)
 
-        run_id = None
-        skip_namechange = False
-        if config.training.checkpoint is not None:
-            checkpoint = torch.load(config.training.checkpoint)
-            if "mlflow_run_name" in checkpoint and config.training.resume_run:
-                skip_namechange = True
-                run_id = str(checkpoint["mlflow_run_name"])
-                print(run_id)
+    #     run_id = None
+    #     skip_namechange = False
+    #     if config.training.checkpoint is not None:
+    #         checkpoint = torch.load(config.training.checkpoint)
+    #         if "mlflow_run_name" in checkpoint and config.training.resume_run:
+    #             skip_namechange = True
+    #             run_id = str(checkpoint["mlflow_run_name"])
+    #             print(run_id)
 
-        # run_id -> adaptive needs to be unique, roll random int?
-        # run_name = f"" f"full-rank-everybatch-{os.environ['SLURM_JOBID']}"
-        with mlflow.start_run(run_id=run_id) as run:
-            mlflow.log_param("Slurm jobid", os.environ["SLURM_JOBID"])
-            if not skip_namechange:
-                # dont need to change the name of existing runs
-                run_name = f"{config['name']}-" + run.info.run_name
-                mlflow.set_tag("mlflow.runName", run_name)
+    #     # run_id -> adaptive needs to be unique, roll random int?
+    #     # run_name = f"" f"full-rank-everybatch-{os.environ['SLURM_JOBID']}"
+    #     with mlflow.start_run(run_id=run_id) as run:
+    #         mlflow.log_param("Slurm jobid", os.environ["SLURM_JOBID"])
+    #         if not skip_namechange:
+    #             # dont need to change the name of existing runs
+    #             run_name = f"{config['name']}-" + run.info.run_name
+    #             mlflow.set_tag("mlflow.runName", run_name)
 
-            # print("run_name:", run_name)
-            # print("tracking uri:", mlflow.get_tracking_uri())
-            # print("artifact uri:", mlflow.get_artifact_uri())
-            log.info(f"Rank: {rank}, world size: {size}")
+    #         # print("run_name:", run_name)
+    #         # print("tracking uri:", mlflow.get_tracking_uri())
+    #         # print("artifact uri:", mlflow.get_artifact_uri())
+    #         log.info(f"Rank: {rank}, world size: {size}")
 
-            log.info(f"run_name: {run_name}")
-            log.info(f"tracking uri: {mlflow.get_tracking_uri()}")
-            log.info(f"artifact uri: {mlflow.get_artifact_uri()}")
-            madonna.utils.tracking.log_config(config)
-            # hydra.utils.call(config.training.script, config)
-            fn(config)
-    elif rank == 0 and config.enable_tracking and config.tracker == "wandb":
-        # wandb.login()
-        # wandb.init(
-        #     name=str(config.name),
-        #     project=str(config.tracking.project),
-        #     config=OmegaConf.to_container(config),
-        #     group=f"{config.data.dataset}-{config.model.name}",
-        # )
-        fn(config)
-        # wandb.finish()
+    #         log.info(f"run_name: {run_name}")
+    #         log.info(f"tracking uri: {mlflow.get_tracking_uri()}")
+    #         log.info(f"artifact uri: {mlflow.get_artifact_uri()}")
+    #         madonna.utils.tracking.log_config(config)
+    #         # hydra.utils.call(config.training.script, config)
+    #         fn(config)
+    # # elif rank == 0 and config.enable_tracking and config.tracker == "wandb":
+    # #     fn(config)
     else:
-        # hydra.utils.call(config.training.script, config)
         fn(config)
 
 

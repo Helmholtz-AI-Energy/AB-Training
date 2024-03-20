@@ -28,7 +28,7 @@ done
 if [ -z "${TIMELIMIT}" ]; then TIMELIMIT="8:00:00"; fi
 if [ -z "${GPUS_PER_NODE}" ]; then GPUS_PER_NODE="4"; fi
 if [ -z "${SLURM_NNODES}" ]; then SLURM_NNODES="1"; fi
-if [ -z "${PARTITION}" ]; then PARTITION="gpu_4"; fi
+if [ -z "${PARTITION}" ]; then PARTITION="accelerated"; fi
 
 # BASE_DIR="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/"
 # BASE_DIR="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/"
@@ -65,5 +65,5 @@ salloc \
   --partition="${PARTITION}" \
   -N "${SLURM_NNODES}" \
   --time "${TIMELIMIT}" \
-  --gres gpu:"${GPUS_PER_NODE}" #\
+  --gres gpu:"${GPUS_PER_NODE}" \
   -A hk-project-madonna \

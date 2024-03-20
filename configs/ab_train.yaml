@@ -9,7 +9,7 @@ defaults:
   - log_dir: default.yaml
   # experiment configs allow for version control of specific configurations
   # e.g. hyperparameters for each combination of model and data
-  # - experiment: null
+  - experiment: ab-exps.yaml
   # debugging config (enable through command line, e.g. `python train.py debug=default)
   - debug: null
   # config for hyperparameter optimization
@@ -17,8 +17,8 @@ defaults:
   # optional local config for machine/user specific settings
   # it's optional since it doesn't need to exist and is excluded from version control
   - optional local: default.yaml
-  - override hydra/job_logging: colorlog
-  - override hydra/hydra_logging: colorlog
+  - override hydra/job_logging: none  # colorlog
+  - override hydra/hydra_logging: none  # colorlog
 
 # putting this in here because i see the fix in colorlog...
 hydra:
@@ -26,6 +26,8 @@ hydra:
     handlers:
       file:
         filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+
+log_output: null
 
 # path to original working directory
 # hydra hijacks working directory by changing it to the new log directory

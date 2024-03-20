@@ -3,7 +3,8 @@ import time
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from mpi4py import MPI
+
+# from mpi4py import MPI
 
 
 class TorchSMA(object):

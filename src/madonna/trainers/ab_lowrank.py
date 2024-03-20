@@ -32,6 +32,7 @@ class ABLowRankTrainer(BasicTrainer):
         config,
         lr_scheduler=None,
         metrics=None,
+        tracker=None,
     ):
         super().__init__(
             model=model,
@@ -54,7 +55,10 @@ class ABLowRankTrainer(BasicTrainer):
         self.reset_lr_on_sync = config.training.ab.reset_lr_on_sync
         # ---------------- MISC THINGS ---------------------------------------------------------
         self.comm_generator = torch.Generator().manual_seed(123456)  # no device -> use cpu
+        if isinstance(self.model, DDP):  # get
+            self.model = self.model.module
         self.local_model = self.model
+        self.tracker = tracker
         # --------------------------------------------------------------------------------------
         # ------------------------ SYNC / COMM MODES -------------------------------------
         self.sync_mode = config.training.ab.sync_mode
@@ -83,10 +87,11 @@ class ABLowRankTrainer(BasicTrainer):
             group_ranks = [all_ranks[0 : len(all_ranks) // 2], all_ranks[len(all_ranks) // 2 :]]
             num_groups = 2
         else:
-            group_size = config.training.ab.group_size
+            group_size = int(config.training.ab.group_size)
             # increase group size if needed
             num_groups = self.world_size // group_size
             num_rem_ranks = self.world_size % group_size
+            # print(num_groups, num_rem_ranks, self.world_size, group_size)
             group_sizes = [group_size] * num_groups
             for r in range(num_rem_ranks):
                 group_sizes[r] += 1
@@ -100,6 +105,8 @@ class ABLowRankTrainer(BasicTrainer):
             self.num_b_groups = len(group_ranks[num_groups // 2 :])
             a_groups = torch.tensor(group_ranks[: num_groups // 2])
             b_groups = torch.tensor(group_ranks[num_groups // 2 :])
+
+            log.info(f"Groups:\na: {group_ranks[: num_groups // 2]}\nb: {group_ranks[num_groups // 2:]}")
 
             self.group_a_ranks = a_groups.flatten().tolist()
             self.group_b_ranks = b_groups.flatten().tolist()
@@ -117,12 +124,13 @@ class ABLowRankTrainer(BasicTrainer):
             self.full_b_group = dist.new_group(self.group_b_ranks, use_local_synchronization=True)
 
         else:
+            log.info(f"Groups:\na: None\nb: {group_ranks}")
             self.num_a_groups = 0
             self.num_b_groups = len(group_ranks)
             self.group_a_ranks = []
 
             b_groups = group_ranks
-            self.group_b_ranks = b_groups.flatten().tolist()
+            self.group_b_ranks = all_ranks
             self.a_groups = []
             self.b_groups = []
             for gr in b_groups:
@@ -154,7 +162,10 @@ class ABLowRankTrainer(BasicTrainer):
         for n in self.full_rank_sync_names:
             mod_name = n.split(".")[:-1]
             layer_name = ".".join(mod_name)
-            skip_modules.append(rgetattr(model, layer_name))
+            try:
+                skip_modules.append(rgetattr(model, layer_name))
+            except AttributeError:
+                log.info(f"No module with name: {n} in model")
 
         self.model = ab_utils.convert_network_ab_lowrank(self.model, config, skip_modules)
         self.model.train()
@@ -349,7 +360,8 @@ class ABLowRankTrainer(BasicTrainer):
             if n in ab:
                 if not p.is_contiguous():
                     p.set_(p.contiguous())
-                ab_waits.append(dist.all_reduce(p, op=dist.ReduceOp.AVG, async_op=True))
+                p.div_(self.world_size)
+                ab_waits.append(dist.all_reduce(p, op=dist.ReduceOp.SUM, async_op=True))
         waits += ab_waits
         return waits
 
@@ -362,18 +374,24 @@ class ABLowRankTrainer(BasicTrainer):
         for n, p in mod.named_parameters():
             if n in self.param_name_lists["a"]:
                 # average A across a-groups
-                if self.num_a_groups > 1:
+                if self.num_a_groups > 1 and self.rank in self.group_a_ranks:
                     dist.all_reduce(p, op=dist.ReduceOp.AVG, group=self.full_a_group)
                 root = self.group_a_ranks[0]
                 # send a to b-groups/all
+                if not p.is_contiguous():
+                    with torch.no_grad():
+                        p.set_(p.contiguous())
                 ab_waits.append(dist.broadcast(p, src=root, async_op=True))
             # send b to a-groups/all
             if n in self.param_name_lists["b"]:
                 # average B across b-groups
-                if self.num_b_groups > 1:
+                if self.num_b_groups > 1 and self.rank in self.group_b_ranks:
                     dist.all_reduce(p, op=dist.ReduceOp.AVG, group=self.full_b_group)
                 root = self.group_b_ranks[0]
                 # send a to b-groups/all
+                if not p.is_contiguous():
+                    with torch.no_grad():
+                        p.set_(p.contiguous())
                 ab_waits.append(dist.broadcast(p, src=root, async_op=True))
         waits += ab_waits
         return waits
@@ -396,6 +414,8 @@ class ABLowRankTrainer(BasicTrainer):
             pg["lr"] = self.warmup_lr
 
     def _pre_forward(self):  # OVERWRITE base class
+        # if not self.model_to_run.training:
+        #     return
         # ---------------------- LR Rebound ----------------------------------------
         if not self.in_lr_rebound:
             return
@@ -412,7 +432,9 @@ class ABLowRankTrainer(BasicTrainer):
     @torch.no_grad()
     def _post_train_step(self):
         # TODO: Docs
-        if self.total_train_iterations == self.warmup_steps:
+        if self.total_train_iterations < self.warmup_steps:
+            return
+        elif self.total_train_iterations == self.warmup_steps:
             if self.rank == self.logging_rank:
                 log.info(
                     f"End of Warmup: {self.total_train_iterations} current epoch: {self.current_iter}/{self.iterations_per_train}",
@@ -426,7 +448,7 @@ class ABLowRankTrainer(BasicTrainer):
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
 
-            ab_utils.get_network_compression(self.model_to_run)
+            ab_utils.get_network_compression(self.model_to_run, tracker=self.tracker)
 
         elif (
             self.total_train_iterations % self.steps_btw_syncing == 0
@@ -439,7 +461,7 @@ class ABLowRankTrainer(BasicTrainer):
                     f"current epoch: {self.current_iter}/{self.iterations_per_train} "
                     f"Method: {self.sync_mode}",
                 )
-            ab_utils.compare_basis_ab(self.model_to_run)
+            # ab_utils.compare_basis_ab(self.model_to_run)
 
             synced_model = self._sync_processes()
             self.model_to_run = synced_model
@@ -452,7 +474,7 @@ class ABLowRankTrainer(BasicTrainer):
             # start LR rebound
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
-            ab_utils.get_network_compression(self.model_to_run)
+            ab_utils.get_network_compression(self.model_to_run, tracker=self.tracker)
         elif (
             self.total_train_iterations > self.steps_btw_syncing
             and self.total_train_iterations % self.steps_btw_syncing == self.ddp_steps_after_sync
@@ -468,7 +490,7 @@ class ABLowRankTrainer(BasicTrainer):
                     f"current epoch: {self.current_iter}/{self.iterations_per_train}",
                 )
 
-            ab_utils.compare_basis_ab(self.model_to_run)
+            # ab_utils.compare_basis_ab(self.model_to_run)
 
             self._prep_ab_train(cut_singular_values=True)
 
@@ -478,10 +500,12 @@ class ABLowRankTrainer(BasicTrainer):
 
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
-            ab_utils.get_network_compression(self.model_to_run)
+            ab_utils.get_network_compression(self.model_to_run, tracker=self.tracker)
+
+        if self.current_iter == self.iterations_per_train:
+            ab_utils.get_network_compression(self.model_to_run, tracker=self.tracker)
 
     def _log_train(self, loss):
-        # todo: metrics...
         if self.rank != self.logging_rank:
             return
         try:
@@ -493,7 +517,7 @@ class ABLowRankTrainer(BasicTrainer):
         for group in self.optimizer.param_groups:
             out_lrs.append(group["lr"])
             prnt_str += f"group {len(out_lrs)}: lr {group['lr']:.6f}\t"
-        print(prnt_str)
+        log.info(prnt_str)
         # return out_lrs, prnt_str
 
 

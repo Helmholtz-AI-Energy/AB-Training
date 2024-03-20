@@ -211,8 +211,8 @@ class WandbLogger:
                 tags.extend(tag)
             else:
                 tags.append(tag)
-        if config.baseline:
-            tags.append("baseline")
+        # if config.baseline:
+        #     tags.append("baseline")
         if isinstance(config.training.checkpoint, str):  # checks resume from artifact
             if config.training.checkpoint.startswith(WANDB_ARTIFACT_PREFIX):
                 run_id, project, model_artifact_name = get_run_info(config.training.checkpoint)

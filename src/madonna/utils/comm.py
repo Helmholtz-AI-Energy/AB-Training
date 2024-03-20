@@ -133,16 +133,6 @@ def init_local_group(batchnorm_group_size, batchnorm_group_stride=1):
                 if my_rank in ranks:
                     local_group = tmp_group
 
-        # print(local_groups)
-
-        # for i in range(num_groups):
-        #    start = i * batchnorm_group_size
-        #    end = start + batchnorm_group_size
-        #    ranks = list(range(start, end))
-        #    tmp_group = dist.new_group(ranks = ranks)
-        #    if my_rank in ranks:
-        #        local_group = tmp_group
-
     return local_group
 
 
@@ -305,37 +295,54 @@ def split_process_group_node_local(num_gpus_per_node=4):
 
 
 # do regular init
-def init(method, ranks_per_gpu=1, batchnorm_group_size=1, batchnorm_group_stride=1):
-    # get master address and port
-    # os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
-    from mpi4py import MPI
-
+def init(
+    method,
+    ranks_per_gpu=1,
+    batchnorm_group_size=1,
+    batchnorm_group_stride=1,
+    mpi_comm=None,
+    hostname=None,
+    rank=None,
+    size=None,
+):
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_ROOT
-
-    mpi_comm = MPI.COMM_WORLD
     port = 29500
-    master_address = socket.gethostname()
-    master_address = mpi_comm.bcast(master_address, root=0)
+    # print('h', mpi_comm, hostname)
+    if hostname is not None:
+        comm_size = size
+        comm_rank = rank
+        master_address = hostname
+    else:
+        if mpi_comm is None:
+            from mpi4py import MPI
 
-    # save env vars
-    os.environ["MASTER_ADDR"] = master_address
-    os.environ["MASTER_PORT"] = str(port)
+            mpi_comm = MPI.COMM_WORLD
 
-    comm_size = mpi_comm.Get_size()
-    comm_rank = mpi_comm.Get_rank()
+        # get master address and port
+        # os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
+
+        comm_size = mpi_comm.Get_size()
+        master_address = socket.gethostname()
+        master_address = mpi_comm.bcast(str(master_address), root=0)
+
+        # save env vars
+        os.environ["MASTER_ADDR"] = master_address
+        os.environ["MASTER_PORT"] = str(port)
+
+        comm_rank = mpi_comm.Get_rank()
 
     nccl_world_size = comm_size
     nccl_world_rank = comm_rank
+    # print(mpi_comm.rank, mpi_comm.size, master_address, port)
+    # exit(0)
 
     if method == "nccl-openmpi":
         # addrport = os.getenv("PMIX_SERVER_URI2").split("//")[1]
         # use that URI
         # address = addrport.split(":")[0]
         # use the default pytorch port
-        # port = "29500"
         # os.environ["MASTER_ADDR"] = address
-        # os.environ["MASTER_PORT"] = port
         rank = int(os.getenv("OMPI_COMM_WORLD_RANK", 0))
         world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE", 0))
 
@@ -347,13 +354,7 @@ def init(method, ranks_per_gpu=1, batchnorm_group_size=1, batchnorm_group_stride
         )
 
     elif method == "nccl-slurm":
-        # rank = int(os.getenv("SLURM_PROCID"))
-        # world_size = int(os.getenv("SLURM_NTASKS"))
-        # address = os.getenv("SLURM_LAUNCH_NODE_IPADDR")
-        # port = "29500"
-        # os.environ["MASTER_ADDR"] = address
-        # os.environ["MASTER_PORT"] = port
-        print(os.environ["CUDA_VISIBLE_DEVICES"])
+        print(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
         print(f"device count: {torch.cuda.device_count()}, device number: {comm_rank % 4}")
         torch.cuda.set_device(comm_rank % 4)
         time.sleep(0.01 * comm_rank)
@@ -363,7 +364,7 @@ def init(method, ranks_per_gpu=1, batchnorm_group_size=1, batchnorm_group_stride
             port=port,
             world_size=nccl_world_size,
             is_master=(nccl_world_rank == 0),
-            timeout=dt.timedelta(seconds=3600),
+            timeout=dt.timedelta(seconds=60),
         )
         dist.init_process_group(
             backend="nccl",
@@ -371,13 +372,6 @@ def init(method, ranks_per_gpu=1, batchnorm_group_size=1, batchnorm_group_stride
             world_size=nccl_world_size,
             rank=nccl_world_rank,
         )
-
-        # init DDP
-        # dist.init_process_group(
-        #     backend="nccl",
-        #     rank=rank,
-        #     world_size=world_size
-        # )
     elif method == "gloo":
         time.sleep(0.001 * comm_rank)
 
@@ -386,7 +380,7 @@ def init(method, ranks_per_gpu=1, batchnorm_group_size=1, batchnorm_group_stride
             port=port,
             world_size=nccl_world_size,
             is_master=(nccl_world_rank == 0),
-            timeout=dt.timedelta(seconds=3600),
+            timeout=dt.timedelta(seconds=60),
         )
         dist.init_process_group(
             backend="gloo",
@@ -405,12 +399,11 @@ def init(method, ranks_per_gpu=1, batchnorm_group_size=1, batchnorm_group_stride
             pass
         else:
             torch.cuda.set_device(get_local_rank())
+
         dist.barrier()
-        # dist.barrier(device_ids=[get_local_rank()], group=_DATA_PARALLEL_GROUP)
         disttest = torch.ones(1)
         if method != "gloo":
             disttest = disttest.cuda()
-        # print(disttest)
 
         dist.all_reduce(disttest)
         assert disttest[0] == nccl_world_size, "failed test of dist!"
@@ -498,27 +491,41 @@ def create_sub_groups(group_size: int) -> dist.ProcessGroup:
     return pg
 
 
-def init_and_set_config_rank_size(config):
+def init_and_set_config_rank_size(config, mpi_comm=None):
+    # if mpi_comm is None:
+    #     from mpi4py import MPI
+    #     mpi_comm = MPI.COMM_WORLD
+    # elif isinstance(mpi_comm, str):
+    #     mpi_comm = None
+
     size = 1
     rank = 0
+    hostname = None
+    if "worker_hostname" in config:
+        hostname = config.worker_hostname
+        rank = int(config.worker_rank)
+        size = int(config.worker_size)
+    print(f"in comm: {hostname} {rank} {size}")
+    # init will return a batchnorm group if we want, but we dont really care with this function
+    #   if you want one, make adjustments here
     if "comm_method" in config and config.comm_method == "gloo":
-        init(method="gloo")
+        init(method="gloo", mpi_comm=mpi_comm, hostname=hostname, rank=rank, size=size)
         rank = dist.get_rank()
         size = dist.get_world_size()
         return rank, size
     try:
         if int(os.environ["SLURM_NTASKS"]) > 1 or int(os.environ["OMPI_COMM_WORLD_SIZE"]) > 1:
-            init(method="nccl-slurm")
+            init(method="nccl-slurm", mpi_comm=mpi_comm, hostname=hostname, rank=rank, size=size)
             rank = dist.get_rank()
             size = dist.get_world_size()
     except KeyError:
         try:
             if int(os.environ["OMPI_COMM_WORLD_SIZE"]) > 1:
-                init(method="nccl-slurm")
+                init(method="nccl-slurm", mpi_comm=mpi_comm, hostname=hostname, rank=rank, size=size)
                 rank = dist.get_rank()
                 size = dist.get_world_size()
-        except KeyError:
-            pass
+        except KeyError as e:
+            raise e
 
     return rank, size
 

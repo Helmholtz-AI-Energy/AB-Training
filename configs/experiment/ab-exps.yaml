@@ -37,9 +37,9 @@ training:
       - fc.weight
       - fc.bias
       - conv1.weight
-      # - cls_token
-      # - pos_embed
-      # - head.weight
+      - cls_token
+      - pos_embed
+      - head.weight
     reset_opt: False
     reset_lr_on_sync: True
     lr_rebound_steps: 150

@@ -14,10 +14,10 @@ def get_model(config):
     if config.model is None:
         raise ValueError("model must be specified")
     if config.model.name.startswith("vit"):
-        try:
-            config.model.model.image_size = config.data.train_crop_size
-        except Exception:
-            config.model.model.img_size = config.data.train_crop_size
+        # try:
+        #     config.model.model.image_size = config.data.train_crop_size
+        # except Exception:
+        config.model.model.img_size = config.data.train_crop_size
     with open_dict(config):
         config.model.model.num_classes = config.data.classes
     # if config.model.name.startswith("resnetrs"):
@@ -59,10 +59,7 @@ def get_optimizer(config, network, lr=None):
 
     optimizer = hydra.utils.instantiate(config.training.optimizer)
     kwargs = {}
-    if config.training.init_opt_with_model:
-        first = network
-    else:
-        first = network.parameters()
+    first = network.parameters()
 
     if lr is None and config.training.lr is not None:
         kwargs["lr"] = config.training.lr
@@ -91,13 +88,10 @@ def get_lr_schedules(config, optim, len_ds=None):
     if config.training.lr_schedule._target_ is None:
         # Using timm lr schedulers if its None..
         with open_dict(config):
-            # if "epochs" not in config.training.lr_schedule:
-            #     epochs = config.training.epochs - config.training.lr_schedule.warmup_epochs
-            #     config.training.lr_schedule.epochs = epochs
-            # else:
-            total_epochs = config.training.lr_schedule.epochs + config.training.lr_schedule.warmup_epochs
-            if total_epochs > config.training.epochs:
-                epochs = config.training.lr_schedule.epochs - config.training.lr_schedule.warmup_epochs
+            if config.training.lr_schedule.epochs is None:
+                epochs = config.training.epochs
+                if config.training.lr_schedule.warmup_prefix:
+                    epochs -= config.training.lr_schedule.warmup_epochs
                 config.training.lr_schedule.epochs = epochs
         scheduler, _ = create_scheduler(args=config.training.lr_schedule, optimizer=optim, updates_per_epoch=len_ds)
         return scheduler, None

@@ -3,11 +3,13 @@ from __future__ import annotations
 import glob
 import logging
 import re
+import sys
 import time
 from functools import reduce, wraps
 from pathlib import Path
 from typing import Any, Callable, List, Tuple, Union
 
+import colorlog
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -250,3 +252,102 @@ def reset_adam_state(optimizer, p):
                 state["max_exp_avg_sq"] *= 0
     # if rank == 0:
     #     log.info(f"Reset Optimizer time: {time.perf_counter() - resettime}")
+
+
+def set_logger_config(
+    level: int = logging.INFO,
+    log_file: Union[str, Path] = None,
+    log_to_stdout: bool = True,
+    log_rank: bool = False,
+    colors: bool = True,
+    existing_comm=None,
+) -> None:
+    """
+    Set up the logger. Should only need to be done once.
+    Generally, logging should only be done on the master rank.
+
+    Parameters
+    ----------
+    level: logging.INFO, ...
+           default level for logging
+           default: INFO
+    log_file: str, Path
+              file to save the log to
+              default: None
+    log_to_stdout: bool
+                   flag indicating if the log should be printed on stdout
+                   default: True
+    log_rank: int
+              the MPI rank from which to send logging messages
+    colors: bool
+            flag for using colored logs
+            default: True
+    """
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    hasmpi = False
+    if existing_comm is None:
+        from mpi4py import MPI
+
+        hasmpi = True
+        global_rank = MPI.COMM_WORLD.rank
+    elif existing_comm is not None and not isinstance(existing_comm, str):
+        from mpi4py import MPI
+
+        hasmpi = True
+        rank = existing_comm.Get_rank()
+
+    if hasmpi:
+        if existing_comm != MPI.COMM_WORLD:
+            ranks = f"L/G: {rank} / {global_rank}"
+        else:
+            ranks = f"{rank}"
+    else:
+        ranks = f"{rank}"
+    # Get base logger for Madonna.
+    base_logger = logging.getLogger("madonna")
+    simple_formatter = logging.Formatter(
+        f"{ranks} : [%(asctime)s][%(name)s][%(levelname)s] - %(message)s",
+    )
+    if not log_to_stdout:
+        print(f"No logging to stdout: check file {log_file}")
+
+    class RankFilter(logging.Filter):
+        def filter(self, record):
+            return rank == 0
+
+    if colors:
+        formatter = colorlog.ColoredFormatter(
+            fmt=f"{ranks} : [%(cyan)s%(asctime)s%(reset)s][%(blue)s%(name)s%(reset)s]"
+            f"[%(log_color)s%(levelname)s%(reset)s] - %(message)s",
+            datefmt=None,
+            reset=True,
+            log_colors={
+                "DEBUG": "cyan",
+                "INFO": "green",
+                "WARNING": "yellow",
+                "ERROR": "red",
+                "CRITICAL": "red,bg_white",
+            },
+            secondary_log_colors={},
+        )
+        std_handler = logging.StreamHandler(stream=sys.stdout)
+        std_handler.setFormatter(formatter)
+    else:
+        std_handler = logging.StreamHandler(stream=sys.stdout)
+        std_handler.setFormatter(simple_formatter)
+
+    std_handler.addFilter(RankFilter())
+    if log_to_stdout:
+        base_logger.addHandler(std_handler)
+    if log_file is not None:
+        file_handler = logging.FileHandler(filename=log_file)
+        file_handler.setFormatter(simple_formatter)
+        base_logger.addHandler(file_handler)
+    base_logger.setLevel(level)
+    return file_handler
+
+
+def remove_logger(file_handler):
+    base_logger = logging.getLogger("madonna")
+    base_logger.removeHandler(file_handler)

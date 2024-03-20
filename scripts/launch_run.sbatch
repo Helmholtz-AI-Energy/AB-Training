@@ -62,8 +62,14 @@ export NCCL_COLLNET_ENABLE=0
 #export CONFIGS="${SCRIPT_DIR}DLRT/configs/"
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 export CONFIG_NAME="patchwork_train.yaml"
+
+export CONFIG_NAME="configs/ab_train_cifar.yaml"
+# export CONFIG_NAME="configs/ab_train_imagenet.yaml"
+
+# export TRAIN_SCRIPT="scripts/singularity_train.py"
+# export TRAIN_SCRIPT="scripts/propulate_train.py"
 # srun "${SRUN_PARAMS[@]}" bash -c "export CONFIG_NAME=${CONFIG_NAME}; python -u ${BASE_DIR}madonna/scripts/train.py name='svd-untuned-final' baseline=False enable_tracking=True"
-srun "${SRUN_PARAMS[@]}" bash -c "export CONFIG_NAME=${CONFIG_NAME}; python -u ${BASE_DIR}madonna/scripts/train.py +experiment=patchwork-exps"
+# srun "${SRUN_PARAMS[@]}" bash -c "export CONFIG_NAME=${CONFIG_NAME}; python -u ${BASE_DIR}madonna/scripts/train.py +experiment=patchwork-exps"
 # srun "${SRUN_PARAMS[@]}" bash -c "export CONFIG_NAME=${CONFIG_NAME}; wandb agent hai-energy/madonna2/mv00rpa5"
 
-# srun "${SRUN_PARAMS[@]}" bash -c "cd ${BASE_DIR}madonna/; python -u ${BASE_DIR}madonna/scripts/propulate_train.py"
+srun "${SRUN_PARAMS[@]}" bash -c "cd ${BASE_DIR}madonna/; CONFIG_NAME=${CONFIG_NAME} python -u ${BASE_DIR}madonna/scripts/propulate_train.py"

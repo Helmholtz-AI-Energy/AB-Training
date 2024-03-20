@@ -80,7 +80,7 @@ def _get_network_compression(
     return currently_trainable, total_current_params, full_rank_param_count
 
 
-def get_network_compression(module):
+def get_network_compression(module, tracker=None):
     currently_trainable, total_current_params, full_rank_param_count = _get_network_compression(module)
     # print(currently_trainable, total_current_params, full_rank_param_count)
     if dist.get_rank() == 0:
@@ -89,4 +89,13 @@ def get_network_compression(module):
             f"total current params {total_current_params} "
             f"full rank param count {full_rank_param_count}\t"
             f"Compression: {(total_current_params / full_rank_param_count) * 100:.3f}",
+        )
+    if tracker is not None:
+        tracker.log(
+            {
+                "compression": (total_current_params / full_rank_param_count) * 100,
+                "trainable-params": currently_trainable,
+                "current-params": total_current_params,
+                "full-rank-param-count": full_rank_param_count,
+            },
         )

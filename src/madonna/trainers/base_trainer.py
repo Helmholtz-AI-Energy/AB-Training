@@ -40,6 +40,7 @@ class BasicTrainer(object):
         self.total_train_iterations = 0
         self.current_iter = 0
         self.lr_updates = 0
+        self.last_loss = 0
         self.max_train_iters = max_train_iters
         if iterations_per_train is None:
             log.info(f"No iterations per train specified, using len(train_loader): {len(train_loader)}")
@@ -127,15 +128,19 @@ class BasicTrainer(object):
         self._pre_lr_scheduler()
 
         # LR scheduler
-        self.total_train_iterations += 1
-        self.current_iter += 1
-
-        self.lr_updates += 1
+        self._iterate_train_count()
         self.lr_scheduler.step_update(num_updates=self.lr_updates, metric=loss)
 
         return loss.item()
 
+    def _iterate_train_count(self):
+        # LR scheduler
+        self.total_train_iterations += 1
+        self.current_iter += 1
+        self.lr_updates += 1
+
     def train(self) -> None:
+        self.lr_scheduler.step(self.total_train_iterations // self.iterations_per_train, metric=self.last_loss)
         self.model_to_run.train()  # Put model in training mode
 
         self.current_iter = 0
@@ -162,6 +167,8 @@ class BasicTrainer(object):
             if self.current_iter == self.iterations_per_train:
                 break
             t0 = time.perf_counter()
+
+        self.last_loss = loss
 
         if self.current_iter % self.log_freq != 0:
             self._log_train(loss)
