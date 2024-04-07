@@ -1,4 +1,4 @@
-common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/resnet/common.yaml
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/resnet/common0.01.yaml
 name: ab-2k
 baseline: False
 tracking:

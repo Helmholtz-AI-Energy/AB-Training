@@ -1,0 +1,25 @@
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/resnet/common0.01.yaml
+name: baseline-16k-weak
+baseline: true
+tracking:
+  log_to_stdout: True
+  tags:
+    - scaling
+    - baseline
+    - weak
+data:
+  local_batch_size: 64
+training:
+  iterations_per_train: 300
+  checkpoint: null
+  checkpoint_out_root: null
+  save_period: 25
+  ab:
+    warmup_steps: 100000000
+# training:
+#   iterations_per_train: 75
+#   checkpoint: null
+#   checkpoint_out_root: null
+#   save_period: 25
+#   ab:
+#     warmup_steps: 100000000

@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
 
 # Slurm job configuration
-#SBATCH --nodes=16
+#SBATCH --nodes=32
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
-#SBATCH --time=48:00:00
-#SBATCH --job-name=madonna-im-vit-ab
+#SBATCH --time=10:00:00
+#SBATCH --job-name=madonna-im-rn50-base-weak
 #SBATCH --partition=accelerated
 #SBATCH --account=hk-project-madonna
 #SBATCH --output="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/logs/slurm/slurm-%j"
+#SBATCH --exclude=hkn[0431,0702,0704]
+
+# export CONFIG_NAME="configs/imagenet/vit/ab_4nodes_bs4k.yaml"
+# export CONFIG_NAME="configs/imagenet/vit/baseline_bs32k.yaml"
+
+export CONFIG_NAME="configs/imagenet/resnet/ab_32nodes_bs32k0.01.yaml"
+# export CONFIG_NAME="configs/imagenet/resnet/baseline_bs32k0.01.yaml"
+
+# export CONFIG_NAME="configs/ab_train_prop_im_rs.yaml"
+# export TRAIN_SCRIPT="scripts/propulate_train.py"
+
+export TRAIN_SCRIPT="scripts/singularity_train.py"
 
 
 ml purge
@@ -45,17 +57,10 @@ export VENV_NAME="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/containers/tes
 export SINGULARITY_FILE="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/containers/torch_new.sif"
 
 
-# export CONFIG_NAME="configs/imagenet/vit/ab_8nodes_bs8k.yaml"
-export CONFIG_NAME="configs/imagenet/vit/ab_16nodes_bs16k.yaml"
-# export CONFIG_NAME="configs/imagenet/resnet/ab_4nodes_bs4k.yaml"
 
-
-# export TRAIN_SCRIPT="scripts/propulate_train.py"
-
-export TRAIN_SCRIPT="scripts/singularity_train.py"
 # PATH=$PATH:/home/kit/scc/qv2382/.local/bin
 # echo "--bind ${TOMOUNT} ${SINGULARITY_FILE} /usr/bin/sh -c export CUDA_VISIBLE_DEVICES=0,1,2,3; source ${VENV_NAME}/bin/activate; cd ${MADONNA}; CONFIG_NAME=${CONFIG_NAME} python scripts/singularity_train.py"
 srun "${SRUN_PARAMS[@]}" singularity exec --nv \
   --bind "${TOMOUNT}" \
   "${SINGULARITY_FILE}" \
-  /usr/bin/sh -c "export CUDA_VISIBLE_DEVICES=0,1,2,3; source ${VENV_NAME}/bin/activate; cd ${MADONNA}; CONFIG_NAME=${CONFIG_NAME} python -u ${TRAIN_SCRIPT}"
+  bash -c "export CUDA_VISIBLE_DEVICES=0,1,2,3; source ${VENV_NAME}/bin/activate; cd ${MADONNA}; CONFIG_NAME=${CONFIG_NAME} python -u ${TRAIN_SCRIPT}"

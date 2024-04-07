@@ -10,6 +10,7 @@ from rich.pretty import pprint
 import madonna
 import wandb
 from madonna import utils
+from madonna.utils import rsetattr
 
 try:
     config_name = os.environ["CONFIG_NAME"]

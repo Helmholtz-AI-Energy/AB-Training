@@ -11,7 +11,7 @@ training:
   checkpoint_out_root: null
   save_period: 25
   ab:
-    warmup_steps: 2325  # 9300/4
-    steps_btw_syncing: 375  # 1500 /4
+    warmup_steps: 3750  # using epoch 50 instead of -> 9300/4
+    steps_btw_syncing: 600  # 1500 /4
     ddp_steps_after_sync: 75  # 300 /4
     lr_rebound_steps: 188  # 750 /4

@@ -59,6 +59,10 @@ def objective_subprocess(search_params, comm=MPI.COMM_WORLD):
     # ---------------- load base config + overwrite with params from propulate --------------------
     conf_file = os.environ["CONFIG_NAME"]
     config = OmegaConf.load(conf_file)
+    if "common" in config:
+        # load the common dict
+        common = OmegaConf.load(config.common)
+        config = OmegaConf.merge(common, config)
     comm.barrier()
     with open_dict(config):
         try:
@@ -118,7 +122,7 @@ def objective_subprocess(search_params, comm=MPI.COMM_WORLD):
 
     num_tries = 3
     ret_val = None
-    kill = 0
+    # kill = 0
     timeout = 2
     while num_tries > 0:
         try:

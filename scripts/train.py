@@ -37,7 +37,7 @@ def main(config: DictConfig):
     #
     # optimizer = madonna.utils.get_optimizer(config, model)
     # sch, warmup = madonna.utils.get_lr_schedules(config, optimizer, 10)
-    pprint("before comm init")
+    # pprint("before comm init")
     # rank, size = utils.comm.init_and_set_config_rank_size(config)
     # with open_dict(config):
     #     config["world_size"] = size
@@ -56,6 +56,7 @@ def main(config: DictConfig):
         raise ValueError(f"unknown trainer: {config.training.trainer}")
 
     if config.tracking.sweep is not None:
+        rank, size = utils.comm.init_and_set_config_rank_size(config)
         if rank == 0:
 
             def func():

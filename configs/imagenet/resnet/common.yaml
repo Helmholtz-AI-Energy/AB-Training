@@ -96,7 +96,7 @@ training:
   optimizer:
     _partial_: true
     _target_: torch.optim.AdamW
-    weight_decay: 0.25  # default 0.01
+    weight_decay: 0.1  # default 0.01
     beta1: 0.9
     beta2: 0.999
   max_grad_norm: 1.0

@@ -1,5 +1,4 @@
-common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/vit/common.yaml
-
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/resnet/common0.01.yaml
 name: ab-16k-weak
 baseline: False
 tracking:
@@ -9,7 +8,6 @@ tracking:
     - weak
 data:
   local_batch_size: 64
-# weak setup
 training:
   iterations_per_train: 300
   use_early_stopping: true
@@ -17,18 +15,19 @@ training:
   checkpoint_out_root: null
   save_period: 25
   ab:
-    warmup_steps: 12300  # original 9300
-    steps_btw_syncing: 2180  # originl: 1500
+    warmup_steps: 9300
+    steps_btw_syncing: 3000 # 1500
     ddp_steps_after_sync: 300
     lr_rebound_steps: 750
-# -------------------
+
+
 # training:
 #   iterations_per_train: 75
 #   checkpoint: null
 #   checkpoint_out_root: null
 #   save_period: 25
 #   ab:
-#     warmup_steps: 3075  # 9300/4
-#     steps_btw_syncing: 750  # 1500 /4
+#     warmup_steps: 3750  # using epoch 50 instead of -> 9300/4
+#     steps_btw_syncing: 600  # 1500 /4
 #     ddp_steps_after_sync: 75  # 300 /4
 #     lr_rebound_steps: 188  # 750 /4

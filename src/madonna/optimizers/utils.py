@@ -38,8 +38,8 @@ def change_adam_shapes(optimizer):
                             target_shape=p.shape,
                             padding_value=0,
                         )
-                        state[k] = new_state
-                if group["amsgrad"]:
+                        state[k] = new_state.contiguous()
+                if "amsgrad" in group and group["amsgrad"]:
                     if state["max_exp_avg_sq"].shape != p.shape:
                         k = "max_exp_avg_sq"
                         new_state = pad_or_truncate_tensor(

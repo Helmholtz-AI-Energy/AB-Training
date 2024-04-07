@@ -101,7 +101,8 @@ def main(config, comm=None, subproc=False):  # noqa: C901
         colors=True,
         existing_comm=comm,
     )
-    # log.info(f"Test log: my worker rank: {comm.rank} size: {comm.size}, COMM_WORLD rank {MPI.COMM_WORLD.rank} size {MPI.COMM_WORLD.size}")
+    # log.info(f"Test log: my worker rank: {comm.rank} size: {comm.size}, COMM_WORLD
+    # rank {MPI.COMM_WORLD.rank} size {MPI.COMM_WORLD.size}")
     # print(rank, size)
     if rank == 0:
         log.info(f"Config: {config}")

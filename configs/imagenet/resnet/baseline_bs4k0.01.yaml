@@ -1,6 +1,5 @@
-common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/vit/common.yaml
-
-name: baseline-4k-weak
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/resnet/common0.01.yaml
+name: baseline-4k
 baseline: true
 tracking:
   log_to_stdout: True

@@ -12,7 +12,7 @@ training:
   checkpoint_out_root: null
   save_period: 25
   ab:
-    warmup_steps: 18600  # 9300/0.5
-    steps_btw_syncing: 3000  # 1500 /0.5
+    warmup_steps: 24600  # 9300/0.5
+    steps_btw_syncing: 4360  # 1500 /0.5
     ddp_steps_after_sync: 600  # 300 /0.5
     lr_rebound_steps: 1500  # 750 /0.5

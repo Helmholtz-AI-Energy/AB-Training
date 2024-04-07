@@ -3,11 +3,12 @@ import time
 from copy import deepcopy
 from typing import cast
 
+import omegaconf
 import scipy
 import torch
 import torch.distributed as dist
 import torch.nn.utils.prune as prune
-from omegaconf import open_dict
+from omegaconf import OmegaConf, open_dict
 from torch.nn.modules import Module
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -33,7 +34,32 @@ class ABLowRankTrainer(BasicTrainer):
         lr_scheduler=None,
         metrics=None,
         tracker=None,
+        already_converted_model=False,
     ):
+        if not isinstance(config, OmegaConf):
+            config = self.sanitize_config(config)
+            config = OmegaConf.create(config)
+        try:
+            autocast = config.model.autocast
+        except AttributeError:
+            autocast = None
+        try:
+            grad_norm = config.training.max_grad_norm
+        except AttributeError:
+            grad_norm = None
+        try:
+            iterations_per_train = config.training.iterations_per_train
+        except AttributeError:
+            iterations_per_train = None
+        try:
+            log_freq = config.training.print_freq
+        except AttributeError:
+            log_freq = None
+        try:
+            log_rank = config.tracking.logging_rank
+        except AttributeError:
+            log_rank = None
+
         super().__init__(
             model=model,
             optimizer=optimizer,
@@ -42,12 +68,13 @@ class ABLowRankTrainer(BasicTrainer):
             train_loader=train_loader,
             lr_scheduler=lr_scheduler,
             metrics=metrics,
-            use_autocast=config.model.autocast,
-            max_grad_norm=config.training.max_grad_norm,
-            iterations_per_train=config.training.iterations_per_train,
-            log_freq=config.training.print_freq,
-            logging_rank=config.tracking.logging_rank,
+            use_autocast=autocast,
+            max_grad_norm=grad_norm,
+            iterations_per_train=iterations_per_train,
+            log_freq=log_freq,
+            logging_rank=log_rank,
         )
+
         self.config = config
         self.warmup_steps = config.training.ab.warmup_steps
         self.steps_btw_syncing = config.training.ab.steps_btw_syncing
@@ -55,7 +82,7 @@ class ABLowRankTrainer(BasicTrainer):
         self.reset_lr_on_sync = config.training.ab.reset_lr_on_sync
         # ---------------- MISC THINGS ---------------------------------------------------------
         self.comm_generator = torch.Generator().manual_seed(123456)  # no device -> use cpu
-        if isinstance(self.model, DDP):  # get
+        if isinstance(self.model, DDP):  # get local model is the model is already DDP, will reinit with my stuff anyway
             self.model = self.model.module
         self.local_model = self.model
         self.tracker = tracker
@@ -141,7 +168,7 @@ class ABLowRankTrainer(BasicTrainer):
             self.full_a_group = None
             self.full_b_group = None  # both are the full normal world
 
-        if config.training.ab.full_rank_sync_names is None:
+        if "full_rank_sync_name" not in config.training.ab or config.training.ab.full_rank_sync_names is None:
             full_rank_sync_names = []
         else:
             full_rank_sync_names = config.training.ab.full_rank_sync_names
@@ -167,7 +194,8 @@ class ABLowRankTrainer(BasicTrainer):
             except AttributeError:
                 log.info(f"No module with name: {n} in model")
 
-        self.model = ab_utils.convert_network_ab_lowrank(self.model, config, skip_modules)
+        if not already_converted_model:
+            self.model = ab_utils.convert_network_ab_lowrank(self.model, config, skip_modules)
         self.model.train()
 
         # Get lists of param names: always sync in full, 1d, multi-dim weights, a, b
@@ -208,12 +236,18 @@ class ABLowRankTrainer(BasicTrainer):
         # -------------------------------- DDP + WARMUP SETUP ------------------------------
 
         # start in warmup mode (standard global DDP)
-        self.sync_bn = config.training.sync_batchnorm
+        if "sync_batchnorm" in config.training:
+            self.sync_bn = config.training.sync_batchnorm
+        else:
+            self.sync_bn = False
 
         if self.sync_bn:
             self.sbn_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model).to(device)
             self.model_to_run = self.sbn_model
+        else:
+            self.sbn_model = self.model.to(device)
 
+        print(f"warmup_steps: {self.warmup_steps}")
         if self.warmup_steps > 0:
             # starting in warmup phase
             templ = self.param_name_lists["a"] + self.param_name_lists["b"]
@@ -246,8 +280,64 @@ class ABLowRankTrainer(BasicTrainer):
         self.lr_rebound_steps = config.training.ab.lr_rebound_steps
         self.current_lr_rebound_step = 0
         self.lr_rebound_step_factor = [0] * len(self.optimizer.param_groups)
-        self.warmup_lr = config.training.lr_schedule.warmup_lr
+        if hasattr(self.optimizer, "optimizer"):
+            self.lr_rebound_step_factor = [0] * len(self.optimizer.optimizer.param_groups)
+        self.warmup_lr = 1e-5
+        # self.warmup_lr = config.training.lr_schedule.warmup_lr
+        self.target_weight_decays = []
+        for pg in self.optimizer.param_groups:
+            if "weight_decay" in pg:
+                self.target_weight_decays.append(pg["weight_decay"])
         # -------------------------------------------------------------------
+
+    @staticmethod
+    def sanitize_config(config):
+        def filter_omegaconf_compatible(config_dict):
+            """Removes keys with non-OmegaConf-compatible values from a dictionary.
+
+            Args:
+                config_dict: The dictionary to filter.
+
+            Returns:
+                A new dictionary containing only OmegaConf-compatible key-value pairs.
+            """
+            filtered_dict = {}
+            for key, value in config_dict.items():
+                if is_omegaconf_compatible(value):
+                    filtered_dict[key] = value
+            return filtered_dict
+
+        def is_omegaconf_compatible(value):
+            """Checks if a value is compatible for use in an OmegaConf DictConfig.
+
+            Args:
+                value: The value to test.
+
+            Returns:
+                True if the value is compatible, False otherwise.
+            """
+
+            try:
+                # 1. Basic types compatibility
+                if isinstance(value, (bool, int, float, str, type(None))):
+                    return True
+
+                # 2. Handling lists and dictionaries
+                elif isinstance(value, (list, tuple)):  # OmegaConf supports lists and tuples
+                    return all(is_omegaconf_compatible(item) for item in value)
+                elif isinstance(value, dict):
+                    return all(is_omegaconf_compatible(k) and is_omegaconf_compatible(v) for k, v in value.items())
+
+                # 3. Attempt to create a temporary DictConfig (best effort)
+                else:
+                    omegaconf.DictConfig({"_temp": value})
+                    return True
+
+            except (omegaconf.errors.OmegaConfBaseException, TypeError):
+                return False
+
+        filtered_conf = filter_omegaconf_compatible(config)
+        return filtered_conf
 
     def _prep_ab_train(self, cut_singular_values=False):
         # TODO: fix the DDP issue in the model/ddp model/local model.....im getting tired
@@ -263,6 +353,10 @@ class ABLowRankTrainer(BasicTrainer):
         # need to resize the optimizer states after change ab_train_mode
         if cut_singular_values:
             opt_utils.change_adam_shapes(self.optimizer)
+            try:
+                opt_utils.change_adam_shapes(self.optimizer.optimizer)
+            except AttributeError:
+                pass
 
         logmsg = f"AB Training: mode {self.my_train_ab_mode}\tDDP Ignore list includes: Nd, "
         nd = self.param_name_lists["Nd"]
@@ -408,10 +502,19 @@ class ABLowRankTrainer(BasicTrainer):
     def _setup_lr_rebound(self):
         self.in_lr_rebound = True
         self.current_lr_rebound_step = 0
+        current_lr = 0
         for c, pg in enumerate(self.optimizer.param_groups):
-            target_lr = self.lr_scheduler._get_lr(self.lr_updates + self.lr_rebound_steps)[c]
-            self.lr_rebound_step_factor[c] = (target_lr - self.warmup_lr) / self.lr_rebound_steps
+            current_lr += pg["lr"]
+            # set target_lr to current lr! will break the warmup when we get to the same level
+            # self.lr_rebound_step_factor[c] = (target_lr - self.warmup_lr) / self.lr_rebound_steps
+            self.lr_rebound_step_factor[c] = (current_lr - self.warmup_lr) / self.lr_rebound_steps
             pg["lr"] = self.warmup_lr
+        if hasattr(self.optimizer, "optimizer"):
+            for c, pg in enumerate(self.optimizer.optimizer.param_groups):
+                current_lr += pg["lr"]
+                # set target_lr to current lr! will break the warmup when we get to the same level
+                self.lr_rebound_step_factor[c] = (current_lr - self.warmup_lr) / self.lr_rebound_steps
+                pg["lr"] = self.warmup_lr
 
     def _pre_forward(self):  # OVERWRITE base class
         # if not self.model_to_run.training:
@@ -421,11 +524,35 @@ class ABLowRankTrainer(BasicTrainer):
             return
         # if not in reboud, act normally. otherwise, increase the lr by lr_rebound_factor
         self.current_lr_rebound_step += 1
+        # exist_lr_warmup = False
         for c, pg in enumerate(self.optimizer.param_groups):
-            pg["lr"] = self.lr_rebound_step_factor[c] * self.current_lr_rebound_step
-            if self.logging_rank == self.rank and self.current_lr_rebound_step % 10 == 0:
-                log.info(f"In LR rebound: actual LR: {pg['lr']:.6f}")
+            # pg["lr"] = self.lr_rebound_step_factor[c] * self.current_lr_rebound_step
+            new_lr = self.lr_rebound_step_factor[c] * self.current_lr_rebound_step
+            # this CHANGES the LR at the top of the iteration, and will overwrite the LR scheduler
+            if new_lr < pg["lr"] and self.logging_rank == self.rank and self.current_lr_rebound_step % 10 == 0:
+                log.info(f"In LR rebound: actual LR: {new_lr:.6f}")
+            elif new_lr >= pg["lr"]:
+                continue
+            pg["lr"] = new_lr
+        if hasattr(self.optimizer, "optimizer"):
+            for c, pg in enumerate(self.optimizer.optimizer.param_groups):
+                # pg["lr"] = self.lr_rebound_step_factor[c] * self.current_lr_rebound_step
+                new_lr = self.lr_rebound_step_factor[c] * self.current_lr_rebound_step
+                # this CHANGES the LR at the top of the iteration, and will overwrite the LR scheduler
+                if new_lr < pg["lr"] and self.logging_rank == self.rank and self.current_lr_rebound_step % 10 == 0:
+                    log.info(f"In LR rebound: actual LR: {new_lr:.6f}")
+                elif new_lr >= pg["lr"]:
+                    continue
+                pg["lr"] = new_lr
+
+            # # turning off WD during rebound
+            # if "weight_decay" in pg:
+            #     pg["weight_decay"] *= 0
+
         if self.current_lr_rebound_step >= self.lr_rebound_steps:
+            # for c, pg in enumerate(self.optimizer.param_groups):
+            #     if "weight_decay" in pg:
+            #         pg["weight_decay"] += self.target_weight_decays[c]
             self.in_lr_rebound = False
         # --------------------------------------------------------------------------
 
@@ -445,6 +572,10 @@ class ABLowRankTrainer(BasicTrainer):
             if self.comm_reset_opt_on_sync:
                 for _n, p in list(self.model_to_run.named_parameters()):
                     utils.reset_adam_state(self.optimizer, p)
+                    try:
+                        utils.reset_adam_state(self.optimizer.optimizer, p)
+                    except AttributeError:
+                        pass
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
 
@@ -471,6 +602,10 @@ class ABLowRankTrainer(BasicTrainer):
             if self.comm_reset_opt_on_sync:
                 for _n, p in list(self.model_to_run.named_parameters()):
                     utils.reset_adam_state(self.optimizer, p)
+                    try:
+                        utils.reset_adam_state(self.optimizer.optimizer, p)
+                    except AttributeError:
+                        pass
             # start LR rebound
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
@@ -497,6 +632,10 @@ class ABLowRankTrainer(BasicTrainer):
             if self.comm_reset_opt_on_sync:
                 for _n, p in list(self.model_to_run.named_parameters()):
                     utils.reset_adam_state(self.optimizer, p)
+                    try:
+                        utils.reset_adam_state(self.optimizer.optimizer, p)
+                    except AttributeError:
+                        pass
 
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()

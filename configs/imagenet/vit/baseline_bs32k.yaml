@@ -1,14 +1,17 @@
 common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/vit/common.yaml
 
-name: baseline-32k
+name: baseline-32k-weak
 baseline: true
 tracking:
   log_to_stdout: True
   tags:
     - scaling
     - baseline
+    - weak
+data:
+  local_batch_size: 32
 training:
-  iterations_per_train: 38
+  iterations_per_train: 300 # 38
   checkpoint: null
   checkpoint_out_root: null
   save_period: 25

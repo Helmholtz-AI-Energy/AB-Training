@@ -1,0 +1,44 @@
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/resnet/common.yaml
+
+name: prop-4k
+baseline: False
+tracking:
+  log_to_stdout: True
+  tags:
+    - propulate
+training:
+  iterations_per_train: 300  # 300 for 4k tests
+  checkpoint: null
+  checkpoint_out_root: null
+  save_period: 25
+  optimizer:
+    weight_decay: 0.1  # default from ViT paper
+  ab:
+    warmup_steps: 4650  # 9300/2
+    steps_btw_syncing: 750  # 1500 /2
+    ddp_steps_after_sync: 150  # 300 /2
+    lr_rebound_steps: 325  # 750 /2
+propulate:
+  ranks_per_worker: 16  # 4 node per worker, 4 workers/node = 16 workers and 4 nodes
+  num_islands: 4
+  migration_probability: 0.9
+  crossover: 0.7
+  mutation: 0.4
+  random: 0.1
+  pollination: True
+  log_path: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/logs/propulate/imagenet-resnet-2/
+  checkpoint_path: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/hpsearch/imagenet-resnet-2/
+  search_space:
+    training.lr: [0.001, 0.005]
+    # Optimizer things
+    # Scheduler stuff
+    training.lr_schedule.min_lr: [0.00001, 0.003]
+    # AB stuff
+    training.ab.warmup_steps: [8000, 12000]
+    training.ab.steps_btw_syncing: [1000, 4000]
+    training.ab.ddp_steps_after_sync: [150, 1000]
+    training.ab.low_rank_cutoff: [0.1, 0.4]
+    training.ab.sync_mode: [with-stale, only-b]
+    training.ab.train_comm_setup: [individual, groups]
+    training.ab.group_size: ['1', '2', '4', '8']
+    training.ab.lr_rebound_steps: [700, 1000]

@@ -1,11 +1,14 @@
 common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/vit/common.yaml
 
-name: ab-4k
+name: ab-4k-weak
 baseline: False
 tracking:
   log_to_stdout: True
   tags:
     - scaling
+    - weak
+data:
+  local_batch_size: 256
 training:
   iterations_per_train: 300
   use_early_stopping: true
@@ -13,7 +16,7 @@ training:
   checkpoint_out_root: null
   save_period: 25
   ab:
-    warmup_steps: 9300
-    steps_btw_syncing: 1500
+    warmup_steps: 12300  # original 9300
+    steps_btw_syncing: 2180  # originl: 1500
     ddp_steps_after_sync: 300
     lr_rebound_steps: 750

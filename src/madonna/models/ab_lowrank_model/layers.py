@@ -13,25 +13,32 @@ log = logging.getLogger(__name__)
 
 
 class ABLowRankLayer(nn.Module):
-    def __init__(self, base_layer: nn.Module, config: dict = None, mutli_dim_bias: bool = False):
+    def __init__(self, base_layer: nn.Module, config: dict = None, mutli_dim_bias: bool = False, output_dim=0):
         # class objective: replace the weight with an AB low-rank decomp
         # TODO: should super be called or not??
         # super().__init__()
-        self.full_rank_weight = nn.Parameter(base_layer.weight.clone().detach(), requires_grad=False)
+        self.full_rank_weight: nn.Parameter = nn.Parameter(base_layer.weight.clone().detach(), requires_grad=False)
+        wght_factory = {"dtype": base_layer.weight.dtype, "device": base_layer.weight.device}
         self.multi_dim_bias = mutli_dim_bias
+        self.a_bias: nn.Parameter = torch.empty(1)
+        self.b_bias: nn.Parameter = torch.empty(1)
+        self.bias_shp = ()
+        self.bias_trans = False
         if mutli_dim_bias:
             if base_layer.bias.ndim > 1:
-                self.full_rank_bias = nn.Parameter(base_layer.bias.clone().detach(), requires_grad=False)
-                self.a_bias = nn.Parameter(torch.empty(1), requires_grad=True)
-                self.b_bias = nn.Parameter(torch.empty(1), requires_grad=True)
-                self.bias_shp = self.base_layer.bias.shape
-                self.bias_trans = None
+                self.full_rank_bias: nn.Parameter = nn.Parameter(base_layer.bias.clone().detach(), requires_grad=False)
+                bias_factory = {"dtype": base_layer.bias.dtype, "device": base_layer.bias.device}
+                self.a_bias: nn.Parameter = nn.Parameter(torch.empty(1, **bias_factory), requires_grad=True)
+                self.b_bias: nn.Parameter = nn.Parameter(torch.empty(1, **bias_factory), requires_grad=True)
+                self.bias_shp = base_layer.bias.shape
+                bshp = torch.tensor(self.bias_shp)
+                self.bias_trans = self.bias_shp[0] < bshp[1:].prod()
             else:
                 self.multi_dim_bias = False
 
         self.training_mode_ab = "full"
-        self.a = nn.Parameter(torch.empty(1), requires_grad=True)
-        self.b = nn.Parameter(torch.empty(1), requires_grad=True)
+        self.a: nn.Parameter = nn.Parameter(torch.empty(1, **wght_factory), requires_grad=True)
+        self.b: nn.Parameter = nn.Parameter(torch.empty(1, **wght_factory), requires_grad=True)
         if config is not None:
             self.config = config
             self.low_rank_cutoff = config["training"]["ab"]["low_rank_cutoff"]
@@ -42,10 +49,14 @@ class ABLowRankLayer(nn.Module):
             self.low_rank_cutoff = 0.1
             self.split_sigma = True
             self.logging_rank = 0
-        self.trans = None
         self.shp = self.full_rank_weight.shape
+        self.trans = False
         self.full_numel = self.full_rank_weight.numel()
+        self.output_dim = output_dim  # change this to adjust the 2D repr
+        # if dist.get_rank() == 0:
+        #     print(self.a.dtype, self.b.dtype, self.full_rank_weight.dtype)
 
+    @torch.jit.export
     @torch.no_grad()
     def change_ab_train_mode(self, mode: str, cut_vals: bool):
         """In here, need to change between training modes
@@ -76,6 +87,7 @@ class ABLowRankLayer(nn.Module):
         self.set_ab(mode=mode, cut_vals=cut_vals)
         self._set_req_grad_flags(True)
 
+    # @torch.jit.ignore
     @torch.no_grad()
     def set_ab(self, mode: str, cut_vals: bool = False):
         """set A and B based off the mode of training
@@ -85,10 +97,15 @@ class ABLowRankLayer(nn.Module):
         Args:
             mode (_type_): _description_
         """
-        twodrepr, trans, _ = basis.get_2d_repr(self.full_rank_weight)
-        if self.trans is None:
-            self.trans = trans
-        u, s, vh = torch.linalg.svd(twodrepr, full_matrices=False)
+        twodrepr, trans, _ = basis.get_2d_repr(self.full_rank_weight, output_dim=self.output_dim)
+
+        # if self.trans is None:
+        self.trans = trans
+        dtp = twodrepr.dtype
+        u, s, vh = torch.linalg.svd(twodrepr.to(torch.float32), full_matrices=False)
+        u = u.to(dtp)
+        s = s.to(dtp)
+        vh = vh.to(dtp)
         if cut_vals:
             # TODO: logging
             cut = torch.nonzero(s > s[0] * self.low_rank_cutoff).flatten()[-1]
@@ -105,8 +122,10 @@ class ABLowRankLayer(nn.Module):
                 )
 
         if self.split_sigma:
-            self.a.set_(u @ s.sqrt().diag())
-            self.b.set_(s.sqrt().diag() @ vh)
+            sd = s.sqrt().diag().to(dtp)
+            # print(self.a.dtype, self.b.dtype, u.dtype, self.full_rank_weight.dtype)
+            self.a.set_(u @ sd)
+            self.b.set_(sd @ vh)
         elif mode == "a":
             self.a.set_(u @ s.diag())
             self.b.set_(vh)
@@ -115,10 +134,13 @@ class ABLowRankLayer(nn.Module):
             self.b.set_(s.diag() @ vh)
 
         if self.multi_dim_bias:
-            twodrepr, trans, _ = basis.get_2d_repr(self.full_rank_bias)
-            if self.bias_trans is None:
-                self.bias_trans = trans
-            u, s, vh = torch.linalg.svd(twodrepr, full_matrices=False)
+            twodrepr, trans, _ = basis.get_2d_repr(self.full_rank_bias, output_dim=self.output_dim)
+            self.bias_trans = trans
+            dtp = twodrepr.dtype
+            u, s, vh = torch.linalg.svd(twodrepr.to(torch.float), full_matrices=False)
+            u = u.to(dtp)
+            s = s.to(dtp)
+            vh = vh.to(dtp)
             if cut_vals:
                 # TODO: logging
                 cut = torch.nonzero(s > s[0] * self.low_rank_cutoff).flatten()[-1]
@@ -143,6 +165,7 @@ class ABLowRankLayer(nn.Module):
                 self.a_bias.set_(u)
                 self.b_bias.set_(s.diag() @ vh)
 
+    # @torch.jit.ignore
     def _set_req_grad_flags(self, mode: bool = True):
         if self.training_mode_ab == "full":
             self.full_rank_weight.requires_grad = mode
@@ -175,6 +198,7 @@ class ABLowRankLayer(nn.Module):
         # call on internal layers, then set the weights and such to be what we want
         self._set_req_grad_flags(mode)
 
+    # @torch.jit.ignore
     def set_weight(self):
         if self.training_mode_ab == "full":
             self.base_layer.weight = self.full_rank_weight
@@ -193,6 +217,7 @@ class ABLowRankLayer(nn.Module):
                 self.full_rank_bias.set_(bias)
                 self.base_layer.bias = self.full_rank_bias
 
+    # @torch.jit.export
     def compare_bases(self, n: str = None):
         if not dist.is_initialized():
             return
@@ -229,6 +254,7 @@ class ABLowRankLayer(nn.Module):
         if rank == 0:
             log.info(f"Average sim across procs: {sum(sims) / len(sims)}")
 
+    @torch.jit.ignore
     def get_compression(self):
         trainable = 0
         total = 0
@@ -259,6 +285,7 @@ class ABLinear(ABLowRankLayer, nn.Linear):
         self.bias = existing_layer.bias
         ABLowRankLayer.__init__(self, base_layer=existing_layer, config=config)
         del self.weight
+        # self.trans: torch.Tensor = torch.tensor(self.trans, dtype=torch.bool)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.training_mode_ab == "full":
@@ -293,8 +320,10 @@ class ABConv(ABLowRankLayer, nn.modules.conv._ConvNd):
         ABLowRankLayer.__init__(self, base_layer=existing_layer, config=config)
         self._conv_forward = existing_layer._conv_forward
         del self.weight
+        # self.trans: bool
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # self.trans: bool
         if self.training_mode_ab == "full":
             weight = self.full_rank_weight
         else:

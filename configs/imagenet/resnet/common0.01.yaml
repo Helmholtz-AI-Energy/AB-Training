@@ -5,8 +5,8 @@ train: true
 validate: true
 test: false
 seed: null
-name: common
-baseline: False
+name: baseline-4k
+baseline: true
 comm_method: nccl
 cpu_training: false
 enable_tracking: true
@@ -32,19 +32,11 @@ data:
   use_real: True
   real_label_location: "/hkfs/work/workspace/scratch/qv2382-madonna-ddp/datasets/imagenet-real/reassessed-imagenet/real.json"
 model:
-  model: # vit_b_16 - timm
-    _target_: timm.models.VisionTransformer
-    img_size: null # get this from datasets!! see train_crop_size in dataset!
-    patch_size: 16 # 16 # default: 16
-    depth: 12 # 12 # default: 12
-    num_heads: 12 # 12 # default: 12
-    embed_dim: 768 # default: 768
-    mlp_ratio: 4 # default: 4
-    qkv_bias: False
-    drop_path_rate: 0.1
-    num_classes: null  # get this from datasets -> classes
-  name: vit_b16
-  autocast: True
+  model:
+    _target_: timm.models.resnet50
+    drop_rate: 0.1
+  name: resnet50
+  autocast: true
 tracking:
   logging_rank: 0
   tracking_rank: 0
@@ -58,7 +50,7 @@ tracking:
 training:
   start_epoch: 0
   epochs: 150
-  iterations_per_train: 75
+  iterations_per_train: 300
   use_early_stopping: true
   early_stopping:
     0.05: 1.5
@@ -104,15 +96,15 @@ training:
   optimizer:
     _partial_: true
     _target_: torch.optim.AdamW
-    weight_decay: 0.1  # default 0.01
+    weight_decay: 0.01  # default 0.01
     beta1: 0.9
     beta2: 0.999
   max_grad_norm: 1.0
   print_freq: 25
   init_method: ortho-sigma
   ab:
-    warmup_steps: 100000000  # 9300/4
-    steps_btw_syncing: 375  # 1500 /4
+    warmup_steps: 1000000000
+    steps_btw_syncing: 1500
     full_rank_sync_names:
       - fc.weight  # resnet
       - fc.bias  # resnet
@@ -122,7 +114,7 @@ training:
       - head.weight  # vit
       - patch_embed.proj.weight
       - patch_embed.proj.bias
-    ddp_steps_after_sync: 75  # 300 /4
+    ddp_steps_after_sync: 300
     low_rank_cutoff: 0.15
     sync_mode: with-stale  # options: full, with-stale, only-learned, only-b
     # NOTE: only-b + groups will never get local divergences (no local group to do b on)
@@ -131,4 +123,4 @@ training:
     split_sigma: true
     reset_opt: false
     reset_lr_on_sync: true
-    lr_rebound_steps: 188  # 750 /4
+    lr_rebound_steps: 750

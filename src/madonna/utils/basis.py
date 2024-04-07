@@ -121,7 +121,7 @@ def compare_bases_baseline(model1: nn.Module, model2: nn.Module, baseline: bool 
                 log.info(f"Similarity {n[-20:]} - {sim.mean():.4f}, top 5: {top5}")
 
 
-def get_2d_repr(weight: torch.Tensor) -> list[torch.Tensor, bool, torch.Size]:
+def get_2d_repr(weight: torch.Tensor, output_dim: int = 0) -> list[torch.Tensor, bool, torch.Size]:
     shp = weight.shape
     dims = weight.squeeze().ndim
     if dims < 2:
@@ -132,7 +132,7 @@ def get_2d_repr(weight: torch.Tensor) -> list[torch.Tensor, bool, torch.Size]:
         return weight.T if trans else weight, trans, shp
 
     # if p.ndim > 2:  # collapse down to 2D
-    hld = weight.view(weight.shape[0], -1)
+    hld = weight.view(weight.shape[output_dim], -1)
     trans = hld.shape[0] < hld.shape[1]
     return hld.T if trans else hld, trans, shp
 
