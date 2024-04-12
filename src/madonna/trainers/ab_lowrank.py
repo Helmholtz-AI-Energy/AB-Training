@@ -150,6 +150,13 @@ class ABLowRankTrainer(BasicTrainer):
             self.full_a_group = dist.new_group(self.group_a_ranks, use_local_synchronization=True)
             self.full_b_group = dist.new_group(self.group_b_ranks, use_local_synchronization=True)
 
+            # print(self.my_ab_group)
+            test = torch.tensor([1], device=self.device)
+            dist.all_reduce(test, group=self.my_ab_group)
+            dist.all_reduce(test, group=self.full_a_group)
+            dist.all_reduce(test, group=self.full_b_group)
+            # print(f"testing group: {group_sizes} test allreduce: {test}")
+
         else:
             log.info(f"Groups:\na: None\nb: {group_ranks}")
             self.num_a_groups = 0
