@@ -254,7 +254,7 @@ class ABLowRankTrainer(BasicTrainer):
         else:
             self.sbn_model = self.model.to(device)
 
-        print(f"warmup_steps: {self.warmup_steps}")
+        # print(f"warmup_steps: {self.warmup_steps}")
         if self.warmup_steps > 0:
             # starting in warmup phase
             templ = self.param_name_lists["a"] + self.param_name_lists["b"]
@@ -265,6 +265,7 @@ class ABLowRankTrainer(BasicTrainer):
                 cut_singular_values=False,
             )
             ddp_model = DDP(self.sbn_model, process_group=None)
+            self.current_train_mode = "full-rank"
         else:
             # no warmup, starting in AB training
             # TODO: set up logic for different syncing modes
@@ -277,6 +278,7 @@ class ABLowRankTrainer(BasicTrainer):
             ign = self.param_name_lists["Nd"] + self.param_name_lists["a" if self.my_train_ab_mode == "b" else "b"]
             self.sbn_model._ddp_params_and_buffers_to_ignore = ign
             ddp_model = DDP(self.sbn_model, process_group=self.my_ab_group)
+            self.current_train_mode = "group"
 
         if self.warmup_steps > 0 or len(self.names_to_always_sync) != 0:
             self.model_to_run = ddp_model  # ddp on all ranks
@@ -385,6 +387,7 @@ class ABLowRankTrainer(BasicTrainer):
         model._ddp_params_and_buffers_to_ignore = ign
         dist.barrier(group=self.my_ab_group)
         self.model_to_run = DDP(model, process_group=self.my_ab_group)
+        self.current_train_mode = "group"
 
     def _prep_full_rank_train(self):
         if isinstance(self.model_to_run, DDP):
@@ -401,6 +404,7 @@ class ABLowRankTrainer(BasicTrainer):
             log.info("Full Rank Syncronous Training\tDDP Ignore list includes: A, B")
         model._ddp_params_and_buffers_to_ignore = ign
         self.model_to_run = DDP(model, process_group=None)
+        self.current_train_mode = "full-rank"
         return self.model_to_run
 
     @torch.no_grad()
@@ -567,6 +571,7 @@ class ABLowRankTrainer(BasicTrainer):
     def _post_train_step(self):
         # TODO: Docs
         if self.total_train_iterations < self.warmup_steps:
+            self.current_train_mode = "full-rank"
             return
         elif self.total_train_iterations == self.warmup_steps:
             if self.rank == self.logging_rank:

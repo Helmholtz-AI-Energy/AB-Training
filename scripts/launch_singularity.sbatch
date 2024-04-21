@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 
 # Slurm job configuration
-#SBATCH --nodes=32
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
 #SBATCH --time=10:00:00
-#SBATCH --job-name=madonna-im-rn50-base-weak
+#SBATCH --job-name=madonna-cifar10-base
 #SBATCH --partition=accelerated
 #SBATCH --account=hk-project-madonna
 #SBATCH --output="/hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/logs/slurm/slurm-%j"
 #SBATCH --exclude=hkn[0431,0702,0704]
 
+# export CONFIG_NAME="configs/cifar10/vgg16/baseline_2nodes.yaml"
+export CONFIG_NAME="configs/cifar10/vgg16/ab_2nodes.yaml"
+
 # export CONFIG_NAME="configs/imagenet/vit/ab_4nodes_bs4k.yaml"
 # export CONFIG_NAME="configs/imagenet/vit/baseline_bs32k.yaml"
 
-export CONFIG_NAME="configs/imagenet/resnet/ab_32nodes_bs32k0.01.yaml"
+# export CONFIG_NAME="configs/imagenet/resnet/ab_32nodes_bs32k0.01.yaml"
 # export CONFIG_NAME="configs/imagenet/resnet/baseline_bs32k0.01.yaml"
 
 # export CONFIG_NAME="configs/ab_train_prop_im_rs.yaml"

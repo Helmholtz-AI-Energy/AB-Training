@@ -1,0 +1,24 @@
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/cifar10/vgg16/common.yaml
+
+name: ab-2nodes
+baseline: true
+tracking:
+  log_to_stdout: True
+  tags:
+    - scaling
+    # - baseline
+# data:
+#   local_batch_size: 64
+# weak setup
+training:
+  iterations_per_train: 100
+  use_early_stopping: False
+  checkpoint: null
+  checkpoint_out_root: null
+  save_period: 25
+  ab:
+    warmup_steps: 4330  #
+    steps_btw_syncing: 759  #
+    ddp_steps_after_sync: 60  #
+    group_size: 4
+    lr_rebound_steps: 267  #

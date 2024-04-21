@@ -1,0 +1,16 @@
+common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/cifar10/vgg16/common.yaml
+
+name: baseline-2nodes
+baseline: true
+tracking:
+  log_to_stdout: True
+  tags:
+    - scaling
+    - baseline
+training:
+  iterations_per_train: 100
+  checkpoint: null
+  checkpoint_out_root: null
+  save_period: 25
+  ab:
+    warmup_steps: 100000000

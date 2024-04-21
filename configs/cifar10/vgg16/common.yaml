@@ -1,0 +1,119 @@
+log_output: null
+original_work_dir: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna
+print_config: false
+train: true
+validate: true
+test: false
+seed: null
+name: common
+baseline: False
+comm_method: nccl
+cpu_training: false
+enable_tracking: true
+tracker: wandb
+data:
+  dataset: cifar10
+  data_dir_horeka: "/hkfs/home/dataset/datasets/CIFAR10/"
+  data_dir_uc2: "/pfs/work7/workspace/scratch/qv2382-madonna-ddp/qv2382-madonna-ddp/datasets/cifar10"
+  num_workers: 6
+  pin_memory: false
+  local_batch_size: 64  # keep global batch size at 512
+  timm_transforms: False
+  persistent_workers: true
+  distributed_sample: True
+  distributed_sample_val: True
+  train_crop_size: 32
+  classes: 100
+model:
+  model:
+    _target_: timm.models.vgg16
+    drop_rate: 0.1
+  name: vgg16
+  autocast: true
+tracking:
+  logging_rank: 0
+  tracking_rank: 0
+  save_checkpoints: false
+  project: lr-dist
+  sweep: null
+  log_file_root: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/logs/experiments/runs/scaling/
+  log_to_stdout: True
+  tags:
+    - scaling
+training:
+  start_epoch: 0
+  epochs: 150
+  iterations_per_train: 100
+  use_early_stopping: False
+  early_stopping:
+    0.05: 1.5
+    0.10: 4.0
+    0.3: 5.5
+    0.5: 7.0
+    0.75: 7.5
+  trainer: ab_trainer
+  checkpoint: null
+  checkpoint_out_root: null
+  save_period: 25
+  resume_run: false
+  resume: false
+  criterion:
+    _target_: torch.nn.CrossEntropyLoss
+    label_smoothing: 0.1
+  lr: 0.003
+  lr_schedule:
+    _target_: null
+    sched: cosine
+    epochs: null
+    warmup_epochs: 10
+    cooldown_epochs: 10
+    min_lr: 1e-05
+    warmup_lr: 1e-05
+    warmup_prefix: true
+    lr_cycle_mul: 1.5
+    lr_cycle_limit: 30
+    lr_cycle_decay: 0.4
+    lr_k_decay: 1.0
+    sched_on_updates: true
+  sync_batchnorm: true
+  federated: false
+  mixup: false
+  mixup_args:
+    mixup_alpha: 0.8
+    cutmix_alpha: 0.0
+    cutmix_minmax: null
+    prob: 1.0
+    switch_prob: 0.5
+    mode: batch
+    num_classes: null
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    weight_decay: 0.1  # default 0.01
+    beta1: 0.9
+    beta2: 0.999
+  max_grad_norm: 1.0
+  print_freq: 25
+  init_method: ortho-sigma
+  ab:
+    warmup_steps: 100000000  # 9300/4
+    steps_btw_syncing: 375  # 1500 /4
+    full_rank_sync_names:
+      - fc.weight  # resnet
+      - fc.bias  # resnet
+      - conv1.weight  # resnet
+      - cls_token  # vit
+      - pos_embed  # vit
+      - head.weight  # vit
+      - patch_embed.proj.weight
+      - patch_embed.proj.bias
+    ddp_steps_after_sync: 75  # 300 /4
+    low_rank_cutoff: 0.15
+    sync_mode: with-stale  # options: full, with-stale, only-learned, only-b
+    # NOTE: only-b + groups will never get local divergences (no local group to do b on)
+    train_comm_setup: groups  # options: individual, groups
+    group_size: 4
+    split_sigma: true
+    reset_opt: false
+    reset_lr_on_sync: true
+    lr_rebound_steps: 188  # 750 /4
