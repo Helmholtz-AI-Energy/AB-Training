@@ -110,7 +110,10 @@ class ABLowRankTrainer(BasicTrainer):
 
         # create the sub-groups in all cases, doesnt hurt (TODO: check that...)
         all_ranks = list(range(0, dist.get_world_size()))
-        if config.training.ab.group_size == -1:
+        if config.training.ab.group_size == -1 and self.sync_mode == "only-b":
+            group_ranks = [all_ranks]
+            num_groups = 1
+        elif config.training.ab.group_size == -1:
             group_ranks = [all_ranks[0 : len(all_ranks) // 2], all_ranks[len(all_ranks) // 2 :]]
             num_groups = 2
         else:
@@ -175,7 +178,7 @@ class ABLowRankTrainer(BasicTrainer):
             self.full_a_group = None
             self.full_b_group = None  # both are the full normal world
 
-        if "full_rank_sync_name" not in config.training.ab or config.training.ab.full_rank_sync_names is None:
+        if "full_rank_sync_names" not in config.training.ab or config.training.ab.full_rank_sync_names is None:
             full_rank_sync_names = []
         else:
             full_rank_sync_names = config.training.ab.full_rank_sync_names
@@ -186,11 +189,6 @@ class ABLowRankTrainer(BasicTrainer):
         # names to not sync during individual training
         # self.ddp_params_and_buffers_to_ignore = []
 
-        if config.training.ab.sync_mode == "only-b":
-            if self.im_logging_rank:
-                log.info("Setting split sigma to False for only-b training")
-            with open_dict(config):
-                config.training.ab.split_sigma = False
         # Create a list of modules to ignore from the specified weights
         skip_modules = []
         for n in self.full_rank_sync_names:
@@ -200,7 +198,7 @@ class ABLowRankTrainer(BasicTrainer):
                 skip_modules.append(rgetattr(model, layer_name))
             except AttributeError:
                 log.info(f"No module with name: {n} in model")
-
+        log.info(f"Modules to skip: {skip_modules} {self.full_rank_sync_names}")
         if not already_converted_model:
             self.model = ab_utils.convert_network_ab_lowrank(self.model, config, skip_modules)
         self.model.train()
@@ -361,11 +359,14 @@ class ABLowRankTrainer(BasicTrainer):
         )
         # need to resize the optimizer states after change ab_train_mode
         if cut_singular_values:
-            opt_utils.change_adam_shapes(self.optimizer)
             try:
-                opt_utils.change_adam_shapes(self.optimizer.optimizer)
-            except AttributeError:
-                pass
+                opt_utils.change_adam_shapes(self.optimizer)
+                try:
+                    opt_utils.change_adam_shapes(self.optimizer.optimizer)
+                except AttributeError:
+                    pass
+            except KeyError:
+                opt_utils.change_sgd_shapes(self.optimizer)
 
         logmsg = f"AB Training: mode {self.my_train_ab_mode}\tDDP Ignore list includes: Nd, "
         nd = self.param_name_lists["Nd"]
@@ -583,11 +584,14 @@ class ABLowRankTrainer(BasicTrainer):
 
             if self.comm_reset_opt_on_sync:
                 for _n, p in list(self.model_to_run.named_parameters()):
-                    utils.reset_adam_state(self.optimizer, p)
                     try:
-                        utils.reset_adam_state(self.optimizer.optimizer, p)
-                    except AttributeError:
-                        pass
+                        utils.reset_adam_state(self.optimizer, p)
+                        try:
+                            utils.reset_adam_state(self.optimizer.optimizer, p)
+                        except AttributeError:
+                            pass
+                    except KeyError:
+                        utils.reset_sgd_state(self.optimizer, p)
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
 
@@ -613,11 +617,14 @@ class ABLowRankTrainer(BasicTrainer):
             # Reset optimizer
             if self.comm_reset_opt_on_sync:
                 for _n, p in list(self.model_to_run.named_parameters()):
-                    utils.reset_adam_state(self.optimizer, p)
                     try:
-                        utils.reset_adam_state(self.optimizer.optimizer, p)
-                    except AttributeError:
-                        pass
+                        utils.reset_adam_state(self.optimizer, p)
+                        try:
+                            utils.reset_adam_state(self.optimizer.optimizer, p)
+                        except AttributeError:
+                            pass
+                    except KeyError:
+                        utils.reset_sgd_state(self.optimizer, p)
             # start LR rebound
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()
@@ -643,11 +650,14 @@ class ABLowRankTrainer(BasicTrainer):
 
             if self.comm_reset_opt_on_sync:
                 for _n, p in list(self.model_to_run.named_parameters()):
-                    utils.reset_adam_state(self.optimizer, p)
                     try:
-                        utils.reset_adam_state(self.optimizer.optimizer, p)
-                    except AttributeError:
-                        pass
+                        utils.reset_adam_state(self.optimizer, p)
+                        try:
+                            utils.reset_adam_state(self.optimizer.optimizer, p)
+                        except AttributeError:
+                            pass
+                    except KeyError:
+                        utils.reset_sgd_state(self.optimizer, p)
 
             if self.reset_lr_on_sync:
                 self._setup_lr_rebound()

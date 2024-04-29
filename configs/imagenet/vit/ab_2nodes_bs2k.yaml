@@ -1,11 +1,12 @@
 common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/vit/common.yaml
 
-name: ab-2k
+name: ab-2k-nogroups
 baseline: False
 tracking:
   log_to_stdout: True
   tags:
     - scaling
+    - no_groups
 training:
   iterations_per_train: 600
   checkpoint: null

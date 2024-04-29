@@ -1,10 +1,11 @@
 common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/resnet/common0.01.yaml
-name: ab-32k-weak
+name: ab-32k-nogroups-weak
 baseline: False
 tracking:
   log_to_stdout: True
   tags:
     - scaling
+    - no_groups
     - weak
 data:
   local_batch_size: 32

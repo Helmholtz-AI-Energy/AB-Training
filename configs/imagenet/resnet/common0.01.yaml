@@ -116,10 +116,10 @@ training:
       - patch_embed.proj.bias
     ddp_steps_after_sync: 300
     low_rank_cutoff: 0.15
-    sync_mode: with-stale  # options: full, with-stale, only-learned, only-b
+    sync_mode: only-b  # with-stale  # options: full, with-stale, only-learned, only-b
     # NOTE: only-b + groups will never get local divergences (no local group to do b on)
     train_comm_setup: groups  # options: individual, groups
-    group_size: 4
+    group_size: -1 # 4
     split_sigma: true
     reset_opt: false
     reset_lr_on_sync: true

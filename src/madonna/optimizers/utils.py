@@ -52,7 +52,7 @@ def change_adam_shapes(optimizer):
         log.info(f"Reset Optimizer time: {time.perf_counter() - resettime}")
 
 
-def change_sgd_shapes(optimizer, model, reset_buffers_zero: bool = False, param_indices=None):
+def change_sgd_shapes(optimizer):
     """
     reset the shapes of the SGD optimizer buffers to be the same shape as the model parameters
 
@@ -62,33 +62,19 @@ def change_sgd_shapes(optimizer, model, reset_buffers_zero: bool = False, param_
     rank = 0 if not dist.is_initialized() else dist.get_rank()
     # print(list(optimizer.param_groups[0].keys()))
     # raise ValueError
-    for c, (n, p) in enumerate(model.named_parameters()):
-        if param_indices is not None and c not in param_indices:
-            continue
-        # if dist.get_rank() == 0:
-        #     print(n, optimizer.param_groups[0]["params"][c].shape, p.shape)
-        settozero = False
-        if n.endswith((".s", "_s")) and p.requires_grad and reset_buffers_zero:
-            settozero = True
-
-        state = optimizer.state[p]
-        # print(list(state.keys()))
-        if len(list(state.keys())) > 0:
-            # if len(optimizer.param_groups[0]["momentum_buffer"]) > 0:
-            if state["momentum_buffer"].shape != p.shape:
-                sl = []
-                for d in range(p.ndim):
-                    sl.append(slice(0, p.shape[d]))
-                state["momentum_buffer"] = state["momentum_buffer"][tuple(sl)]
-            if settozero:
-                state["momentum_buffer"].zero_()
-
-        # if optimizer.param_groups[0]["params"][c].shape != p.shape:
-        #     sl = []
-        #     for d in range(p.ndim):
-        #         sl.append(slice(0, p.shape[d]))
-        #     optimizer.param_groups[0]["params"][c] = optimizer.param_groups[0]["params"][c][tuple(sl)]
-        #     optimizer.param_groups[0]["params"][c].zero_()
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            state = optimizer.state[p]
+            if len(list(state.keys())) > 0:
+                k = "momentum_buffer"
+                if state[k].shape != p.shape:
+                    # new_state = truncate_tensor(state[k], p.shape)
+                    new_state, pading, slices = pad_or_truncate_tensor(
+                        input_tensor=state[k],
+                        target_shape=p.shape,
+                        padding_value=0,
+                    )
+                    state[k] = new_state.contiguous()
     if rank == 0:
         log.info(f"Reset Optimizer time: {time.perf_counter() - resettime}")
 

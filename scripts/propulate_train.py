@@ -13,6 +13,7 @@ from shutil import copy
 
 import numpy as np
 import propulate
+import timm
 import torch.distributed as dist
 from mpi4py import MPI
 from omegaconf import DictConfig, OmegaConf, errors, open_dict
@@ -20,6 +21,8 @@ from propulate.utils import get_default_propagator
 
 import madonna
 from madonna.utils import rgetattr, rsetattr
+
+timm.models.vgg19()
 
 
 def objective(search_params, comm=MPI.COMM_WORLD):

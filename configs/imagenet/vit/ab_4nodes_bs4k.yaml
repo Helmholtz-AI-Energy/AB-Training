@@ -1,11 +1,12 @@
 common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/vit/common.yaml
 
-name: ab-4k-weak
+name: ab-4k-nogroups-weak
 baseline: False
 tracking:
   log_to_stdout: True
   tags:
     - scaling
+    - no_groups
     - weak
 data:
   local_batch_size: 256

@@ -1,15 +1,16 @@
 common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/imagenet/vit/common.yaml
 
-name: ab-32k-weak
+name: ab-32k-nogroups-weak
 baseline: False
 tracking:
   log_to_stdout: True
   tags:
     - scaling
+    - no_groups
     - weak
+# weak setup
 data:
   local_batch_size: 32
-# weak setup
 training:
   iterations_per_train: 300
   use_early_stopping: true
@@ -22,9 +23,9 @@ training:
     ddp_steps_after_sync: 300
     lr_rebound_steps: 750
 # -------------------
-# strong setup
+# # strong setup
 # training:
-#   iterations_per_train: # 38
+#   iterations_per_train: 38
 #   checkpoint: null
 #   checkpoint_out_root: null
 #   save_period: 25

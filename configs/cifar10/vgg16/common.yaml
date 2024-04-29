@@ -17,17 +17,17 @@ data:
   data_dir_uc2: "/pfs/work7/workspace/scratch/qv2382-madonna-ddp/qv2382-madonna-ddp/datasets/cifar10"
   num_workers: 6
   pin_memory: false
-  local_batch_size: 64  # keep global batch size at 512
+  local_batch_size: 128  # keep global batch size at 512
   timm_transforms: False
   persistent_workers: true
   distributed_sample: True
   distributed_sample_val: True
   train_crop_size: 32
-  classes: 100
+  classes: 10
 model:
   model:
     _target_: timm.models.vgg16
-    drop_rate: 0.1
+    drop_rate: 0.
   name: vgg16
   autocast: true
 tracking:
@@ -69,6 +69,10 @@ training:
     cooldown_epochs: 10
     min_lr: 1e-05
     warmup_lr: 1e-05
+    # decay_milestones:
+    #   - 75
+    #   - 112
+    # decay_rate: 0.1
     warmup_prefix: true
     lr_cycle_mul: 1.5
     lr_cycle_limit: 30
@@ -99,6 +103,10 @@ training:
     warmup_steps: 100000000  # 9300/4
     steps_btw_syncing: 375  # 1500 /4
     full_rank_sync_names:
+      - features.0.weight
+      - features.0.bias
+      - head.fc.weight
+      - head.fc.bias
       - fc.weight  # resnet
       - fc.bias  # resnet
       - conv1.weight  # resnet
@@ -109,10 +117,10 @@ training:
       - patch_embed.proj.bias
     ddp_steps_after_sync: 75  # 300 /4
     low_rank_cutoff: 0.15
-    sync_mode: with-stale  # options: full, with-stale, only-learned, only-b
+    sync_mode: only-b  # with-stale  # options: full, with-stale, only-learned, only-b
     # NOTE: only-b + groups will never get local divergences (no local group to do b on)
     train_comm_setup: groups  # options: individual, groups
-    group_size: 4
+    group_size: -1 #4
     split_sigma: true
     reset_opt: false
     reset_lr_on_sync: true

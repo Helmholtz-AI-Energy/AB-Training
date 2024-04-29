@@ -1,11 +1,12 @@
 common: /hkfs/work/workspace/scratch/qv2382-madonna-ddp/madonna/configs/cifar10/vgg16/common.yaml
 
-name: ab-2nodes
+name: ab-2nodes-nogroups
 baseline: true
 tracking:
   log_to_stdout: True
   tags:
     - scaling
+    - nogroups
     # - baseline
 # data:
 #   local_batch_size: 64
